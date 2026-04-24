@@ -16,7 +16,7 @@
 - **`VectorStore._bm25_search()`** — tokenizes the query, scores every document, returns the top candidates.
 - **`VectorStore._rrf_merge()`** — standard RRF with k=60. Chunks that appear in both lists get a combined rank boost; chunks unique to one list are still included.
 - **`VectorStore.add()`** — invalidates the BM25 index whenever new documents are added (e.g. auto-ingest), so the next search rebuilds it automatically.
-- No changes required to `pipeline.py` or `streamlit_app.py` — the upgrade is fully transparent to the rest of the stack.
+- No changes required to `pipeline.py` or the FastAPI/Svelte UI — the upgrade is fully transparent to the rest of the stack.
 
 ## Why this helps
 

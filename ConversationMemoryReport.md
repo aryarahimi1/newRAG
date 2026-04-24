@@ -29,7 +29,7 @@ System prompt
 |---|---|
 | `rag/generate.py` | `generate()` accepts a `history` param — list of `{question, answer}` dicts — and injects them as real `user`/`assistant` messages before the current turn. Capped at last 2 turns to keep prompt size small. |
 | `rag/pipeline.py` | `run()` accepts and forwards `history` to the generator. |
-| `streamlit_app.py` | Full main-pane rewrite. Replaced the static form with `st.chat_input` + `st.chat_message` bubbles. Conversation stored in `st.session_state.messages`. Detail panels (PII, drugs, citations, debug) render below the latest response. Sidebar got a **Clear conversation** button and a sample-question picker. |
+| `frontend` + `api/main.py` | Chat UI with multi-turn history; detail panels (PII, drugs, auto-ingest, citations, debug) below the latest response. Sidebar includes corpus stats, pipeline controls, sample questions, and clear conversation. |
 
 ---
 

@@ -31,7 +31,7 @@ from rag.retrieve import RetrievedChunk, VectorStore, get_store
 
 logger = logging.getLogger(__name__)
 
-# Global lock so two concurrent Streamlit reruns can't ingest the same drug
+# Global lock so two concurrent requests can't ingest the same drug
 # twice at the same time.
 _INGEST_LOCK = threading.Lock()
 

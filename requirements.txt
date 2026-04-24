@@ -1,4 +1,5 @@
-streamlit==1.39.0
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
 chromadb==0.5.23
 # Chroma calls posthog.capture(distinct_id, event, props); posthog 4+ broke that API.
 posthog>=2.5.0,<4.0.0

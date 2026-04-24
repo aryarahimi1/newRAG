@@ -10,7 +10,7 @@ misspellings:
 
 We tokenize the (redacted) query, build 1- and 2-gram candidates, skip
 obvious non-drug tokens via a stopword list, and look each up in RxNorm.
-Results are cached in-process so repeated queries in a Streamlit session
+Results are cached in-process so repeated queries in the same API process
 don't hammer the API.
 """
 
