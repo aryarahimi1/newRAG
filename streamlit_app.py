@@ -118,16 +118,19 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# Main pane
+# Session state
 # ---------------------------------------------------------------------------
 
-st.title("💊 Drug Interaction RAG")
-st.caption(
-    "Ask a natural-language question about drug interactions. "
-    "Your question is PII-redacted, drug mentions are resolved via RxNorm, "
-    "any missing drugs are auto-ingested live from DailyMed + MedlinePlus, "
-    "then reranked and answered by DeepSeek v3.2 with inline citations."
-)
+if "messages" not in st.session_state:
+    # Each entry: {"role": "user"|"assistant", "content": str}
+    st.session_state.messages = []
+
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+
+# ---------------------------------------------------------------------------
+# Sample questions in sidebar
+# ---------------------------------------------------------------------------
 
 sample_questions = [
     "Can I take ibuprofen with lisinopril for my blood pressure?",
@@ -135,24 +138,36 @@ sample_questions = [
     "I'm John Smith (john@example.com). Does metformin interact with alcohol?",
     "What happens if I take sertraline and tramadol together?",
     "Can I take omeprazole while on clopidogrel?",
-    "Does rifampin reduce the effectiveness of warfarin?",  # likely off-corpus
+    "Does rifampin reduce the effectiveness of warfarin?",
 ]
 
-with st.form("ask_form"):
-    question = st.text_area(
-        "Your question",
-        placeholder=sample_questions[0],
-        height=90,
-    )
+with st.sidebar:
+    st.divider()
+    st.markdown("### Sample questions")
     chosen_sample = st.selectbox(
-        "…or try a sample question (used if the box above is empty)",
+        "Pick one to send",
         options=["(select)"] + sample_questions,
+        key="sample_sel",
     )
-    submitted = st.form_submit_button("Ask", type="primary")
+    if st.button("Use sample", disabled=(chosen_sample == "(select)")):
+        st.session_state["_pending"] = chosen_sample
 
-if submitted and (not question or not question.strip()):
-    if chosen_sample and chosen_sample != "(select)":
-        question = chosen_sample
+    st.divider()
+    if st.button("Clear conversation"):
+        st.session_state.messages = []
+        st.session_state.last_result = None
+        st.rerun()
+
+# ---------------------------------------------------------------------------
+# Main pane
+# ---------------------------------------------------------------------------
+
+st.title("💊 Drug Interaction RAG")
+st.caption(
+    "Multi-turn conversation — ask follow-up questions naturally. "
+    "Every question is PII-redacted, drug-detected, retrieved via hybrid "
+    "BM25 + dense search, reranked, and answered by DeepSeek v3.2 with citations."
+)
 
 
 def _render_chunk_card(
@@ -163,7 +178,7 @@ def _render_chunk_card(
     use_expander: bool = True,
     expand_first: bool = False,
 ):
-    """Render one citation chunk. Streamlit forbids `st.expander` inside another expander."""
+    """Render one citation chunk."""
     meta = chunk.metadata or {}
     drug = meta.get("drug_name", "unknown")
     section = meta.get("section", "")
@@ -185,26 +200,9 @@ def _render_chunk_card(
         st.divider()
 
 
-if submitted and question and question.strip():
-    pipeline = _load_pipeline()
-    pipeline.top_k_retrieve = top_k_retrieve
-    pipeline.top_k_rerank = top_k_rerank
-
-    # Live progress panel — populated from the pipeline via a callback.
-    status_box = st.status("Running pipeline…", expanded=True)
-
-    def _on_status(msg: str) -> None:
-        status_box.write(f"• {msg}")
-
-    result = pipeline.run(
-        question,
-        skip_generation=skip_generation,
-        auto_ingest=auto_ingest,
-        on_status=_on_status,
-    )
-    status_box.update(label="Pipeline complete", state="complete", expanded=False)
-
-    # --- Redaction panel ---------------------------------------------------
+def _render_result_panels(result) -> None:
+    """Render the four pipeline detail panels for a RAGResult."""
+    # --- Redaction ---------------------------------------------------------
     st.subheader("1 · PII redaction")
     rc1, rc2 = st.columns(2)
     with rc1:
@@ -222,13 +220,10 @@ if submitted and question and question.strip():
     else:
         st.success("No PII detected.")
 
-    # --- Drug detection + auto-ingest -------------------------------------
+    # --- Drug detection ----------------------------------------------------
     st.subheader("2 · Drug detection & auto-ingest")
     if not result.detected_drugs:
-        st.info(
-            "RxNorm didn't recognize any drug names in the question. "
-            "Retrieval will still run over the existing corpus."
-        )
+        st.info("RxNorm didn't recognize any drug names. Retrieval runs over the full corpus.")
     else:
         cols = st.columns(min(len(result.detected_drugs), 4) or 1)
         for i, d in enumerate(result.detected_drugs):
@@ -241,21 +236,15 @@ if submitted and question and question.strip():
     elif ai.missing:
         names = ", ".join(m.canonical for m in ai.missing)
         if ai.added_chunks > 0:
-            st.success(
-                f"Learned about **{names}** on the fly — added "
-                f"{ai.added_chunks} new chunks to the corpus."
-            )
+            st.success(f"Learned about **{names}** on the fly — added {ai.added_chunks} new chunks.")
         elif ai.error:
             st.warning(f"Auto-ingest note for {names}: {ai.error}")
         else:
-            st.info(
-                f"Tried to ingest **{names}** but no upstream documents were "
-                "returned (likely not in DailyMed/MedlinePlus under that name)."
-            )
+            st.info(f"Tried to ingest **{names}** but no upstream documents were returned.")
     else:
         st.caption("All detected drugs are already in the corpus.")
 
-    # --- Answer panel ------------------------------------------------------
+    # --- Answer ------------------------------------------------------------
     st.subheader("3 · Answer")
     if result.error:
         st.error(f"Generation failed: {result.error}")
@@ -269,10 +258,7 @@ if submitted and question and question.strip():
             )
         st.caption(" · ".join(footer_bits))
     else:
-        st.info(
-            "LLM call skipped. Toggle **Skip LLM call** off in the sidebar "
-            "(and set `OPENROUTER_API_KEY`) to generate an answer."
-        )
+        st.info("LLM call skipped — toggle **Skip LLM call** off in the sidebar.")
 
     # --- Citations ---------------------------------------------------------
     st.subheader("4 · Citations (post-rerank)")
@@ -280,11 +266,9 @@ if submitted and question and question.strip():
         st.info("No relevant passages were retrieved.")
     else:
         for i, c in enumerate(result.reranked):
-            _render_chunk_card(
-                i, c, ordinal=f"[{i + 1}]", expand_first=(i == 0)
-            )
+            _render_chunk_card(i, c, ordinal=f"[{i + 1}]", expand_first=(i == 0))
 
-    # --- Debug pane --------------------------------------------------------
+    # --- Debug -------------------------------------------------------------
     with st.expander("Debug: all retrieved (pre-rerank) + timings", expanded=False):
         t = result.timing
         st.write(
@@ -299,6 +283,83 @@ if submitted and question and question.strip():
             }
         )
         for i, c in enumerate(result.retrieved):
-            _render_chunk_card(
-                i, c, ordinal=f"R{i + 1}", use_expander=False
-            )
+            _render_chunk_card(i, c, ordinal=f"R{i + 1}", use_expander=False)
+
+
+def _build_history() -> list:
+    """Extract completed (question, answer) pairs from session messages for the generator."""
+    msgs = st.session_state.messages
+    history = []
+    for i in range(0, len(msgs) - 1, 2):
+        if msgs[i]["role"] == "user" and i + 1 < len(msgs) and msgs[i + 1]["role"] == "assistant":
+            history.append({"question": msgs[i]["content"], "answer": msgs[i + 1]["content"]})
+    return history
+
+
+# ---------------------------------------------------------------------------
+# Render conversation history
+# ---------------------------------------------------------------------------
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Show detail panels for the most recent result (below the last assistant bubble).
+if st.session_state.last_result:
+    _render_result_panels(st.session_state.last_result)
+
+# ---------------------------------------------------------------------------
+# Handle new input
+# ---------------------------------------------------------------------------
+
+# Grab a pending sample question if the sidebar button was clicked.
+question = st.session_state.pop("_pending", None)
+# Chat input always anchors to the bottom of the page.
+chat_input = st.chat_input("Ask about drug interactions…")
+if chat_input:
+    question = chat_input
+
+if question and question.strip():
+    question = question.strip()
+
+    # Show the user bubble immediately.
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    pipeline = _load_pipeline()
+    pipeline.top_k_retrieve = top_k_retrieve
+    pipeline.top_k_rerank = top_k_rerank
+
+    status_box = st.status("Running pipeline…", expanded=True)
+
+    def _on_status(msg: str) -> None:
+        status_box.write(f"• {msg}")
+
+    history = _build_history()
+
+    result = pipeline.run(
+        question,
+        skip_generation=skip_generation,
+        auto_ingest=auto_ingest,
+        on_status=_on_status,
+        history=history,
+    )
+    status_box.update(label="Pipeline complete", state="complete", expanded=False)
+
+    # Derive the assistant's text for the chat bubble.
+    if result.generation:
+        answer_text = result.generation.answer
+    elif result.error:
+        answer_text = f"_(generation failed: {result.error})_"
+    else:
+        answer_text = "_(LLM call skipped — retrieval only)_"
+
+    with st.chat_message("assistant"):
+        st.markdown(answer_text)
+
+    # Persist to session state.
+    st.session_state.messages.append({"role": "user", "content": question})
+    st.session_state.messages.append({"role": "assistant", "content": answer_text})
+    st.session_state.last_result = result
+
+    st.rerun()

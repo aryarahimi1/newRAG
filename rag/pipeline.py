@@ -125,6 +125,7 @@ class RAGPipeline:
         skip_generation: bool = False,
         auto_ingest: Optional[bool] = None,
         on_status: Optional[Callable[[str], None]] = None,
+        history: Optional[List[dict]] = None,
     ) -> RAGResult:
         timing = StageTiming()
         do_ingest = self.auto_ingest if auto_ingest is None else auto_ingest
@@ -188,7 +189,7 @@ class RAGPipeline:
             _status("Generating grounded answer with DeepSeek…")
             t0 = time.perf_counter()
             try:
-                generation = self.generator.generate(redaction.redacted, reranked)
+                generation = self.generator.generate(redaction.redacted, reranked, history=history)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Generation failed")
                 error = f"{type(exc).__name__}: {exc}"

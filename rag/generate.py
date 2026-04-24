@@ -136,16 +136,22 @@ class DeepSeekGenerator:
         self,
         question: str,
         chunks: Sequence[RetrievedChunk],
+        history: Optional[List[dict]] = None,
         temperature: float = 0.1,
         max_tokens: int = 600,
     ) -> GenerationResult:
-        user_prompt = build_user_prompt(question, chunks)
+        # Build message list: system prompt, then prior turns, then current question.
+        # Prior turns are plain text (no CONTEXT block) so the model treats them as
+        # conversation context rather than retrieval grounding.
+        messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for turn in (history or [])[-2:]:  # cap at last 2 turns to keep prompt small
+            messages.append({"role": "user", "content": turn["question"]})
+            messages.append({"role": "assistant", "content": turn["answer"]})
+        messages.append({"role": "user", "content": build_user_prompt(question, chunks)})
+
         resp = self._client.chat.completions.create(
             model=self.model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )
