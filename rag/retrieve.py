@@ -20,6 +20,7 @@ from typing import Iterable, List, Optional, Sequence
 
 import chromadb
 from chromadb.config import Settings
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,12 @@ class VectorStore:
             metadata={"hnsw:space": "cosine"},
         )
 
+        # BM25 index — built lazily on first hybrid search, invalidated on add().
+        self._bm25: Optional[BM25Okapi] = None
+        self._bm25_ids: List[str] = []
+        self._bm25_docs: List[str] = []
+        self._bm25_metas: List[dict] = []
+
     @property
     def collection(self):
         return self._collection
@@ -102,6 +109,71 @@ class VectorStore:
                 metadatas=batch_meta,
                 embeddings=batch_emb,
             )
+        # Invalidate the BM25 index so it rebuilds with the new documents.
+        self._bm25 = None
+
+    # ------------------------------------------------------------------
+    # BM25 helpers
+    # ------------------------------------------------------------------
+
+    def _build_bm25(self) -> None:
+        """Fetch all documents from Chroma and build the BM25Okapi index."""
+        all_data = self._collection.get(include=["documents", "metadatas"])
+        self._bm25_ids = all_data.get("ids") or []
+        self._bm25_docs = all_data.get("documents") or []
+        self._bm25_metas = all_data.get("metadatas") or []
+        tokenized = [doc.lower().split() for doc in self._bm25_docs]
+        self._bm25 = BM25Okapi(tokenized)
+        logger.info("BM25 index built over %d documents", len(self._bm25_docs))
+
+    def _bm25_search(self, query: str, top_k: int) -> List[RetrievedChunk]:
+        """Return top_k chunks scored by BM25."""
+        if self._bm25 is None:
+            self._build_bm25()
+        scores = self._bm25.get_scores(query.lower().split())  # type: ignore[union-attr]
+        # Pair each score with its index, sort descending, take top_k.
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        chunks: List[RetrievedChunk] = []
+        for idx in top_indices:
+            if scores[idx] <= 0:
+                continue
+            chunks.append(
+                RetrievedChunk(
+                    id=self._bm25_ids[idx],
+                    text=self._bm25_docs[idx],
+                    metadata=self._bm25_metas[idx] or {},
+                    score=float(scores[idx]),
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _rrf_merge(
+        dense: List[RetrievedChunk],
+        bm25: List[RetrievedChunk],
+        top_k: int,
+        k: int = 60,
+    ) -> List[RetrievedChunk]:
+        """Reciprocal Rank Fusion: score = Σ 1/(k + rank). k=60 is standard."""
+        rrf: dict[str, float] = {}
+        chunk_map: dict[str, RetrievedChunk] = {}
+
+        for rank, chunk in enumerate(dense, start=1):
+            rrf[chunk.id] = rrf.get(chunk.id, 0.0) + 1.0 / (k + rank)
+            chunk_map[chunk.id] = chunk
+
+        for rank, chunk in enumerate(bm25, start=1):
+            rrf[chunk.id] = rrf.get(chunk.id, 0.0) + 1.0 / (k + rank)
+            if chunk.id not in chunk_map:
+                chunk_map[chunk.id] = chunk
+
+        ranked = sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        from dataclasses import replace
+        return [replace(chunk_map[cid], score=score) for cid, score in ranked]
+
+    # ------------------------------------------------------------------
+    # Public search — hybrid by default
+    # ------------------------------------------------------------------
 
     def search(
         self,
@@ -111,24 +183,31 @@ class VectorStore:
     ) -> List[RetrievedChunk]:
         if self.count() == 0:
             return []
+
+        # Dense retrieval — fetch a larger candidate pool before merging.
+        dense_k = top_k * 2
         emb = self.embed([query])[0]
         res = self._collection.query(
             query_embeddings=[emb],
-            n_results=top_k,
+            n_results=min(dense_k, self.count()),
             where=where,
         )
-        chunks: List[RetrievedChunk] = []
-        ids = res.get("ids", [[]])[0]
-        docs = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        dists = res.get("distances", [[]])[0]
-        for cid, doc, meta, dist in zip(ids, docs, metas, dists):
-            # Chroma returns cosine *distance* ∈ [0, 2]; convert to similarity.
-            score = 1.0 - float(dist)
-            chunks.append(
-                RetrievedChunk(id=cid, text=doc, metadata=meta or {}, score=score)
+        dense_chunks: List[RetrievedChunk] = []
+        for cid, doc, meta, dist in zip(
+            res.get("ids", [[]])[0],
+            res.get("documents", [[]])[0],
+            res.get("metadatas", [[]])[0],
+            res.get("distances", [[]])[0],
+        ):
+            dense_chunks.append(
+                RetrievedChunk(id=cid, text=doc, metadata=meta or {}, score=1.0 - float(dist))
             )
-        return chunks
+
+        # BM25 retrieval (skip per-field `where` filter — BM25 is corpus-wide).
+        bm25_chunks = self._bm25_search(query, top_k=dense_k)
+
+        # Merge and return top_k.
+        return self._rrf_merge(dense_chunks, bm25_chunks, top_k=top_k)
 
     def indexed_drugs(self) -> set:
         """Return the set of drug names currently represented in the store.
