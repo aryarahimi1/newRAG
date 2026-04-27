@@ -11,7 +11,7 @@ Stages
 3. auto-ingest     (optional) Fetch + index any mentioned drug we don't
                    already have, so the LLM has something real to ground on
 4. retrieve        Embed + search Chroma, top-20
-5. rerank          Cross-encoder, top-5
+5. rerank          Cross-encoder, top-8 (default)
 6. generate        DeepSeek via OpenRouter, grounded + cited
 """
 
@@ -24,15 +24,18 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, List, Optional
 
 from rag.drug_detect import DrugDetector, DrugMention, get_detector, missing_drugs
-from rag.generate import DeepSeekGenerator, GenerationResult, get_generator
+from rag.generate import (
+    DeepSeekGenerator,
+    GenerationError,
+    GenerationResult,
+    get_generator,
+)
 from rag.redact import PIIRedactor, RedactionResult, get_redactor
 from rag.rerank import Reranker, get_reranker
 from rag.retrieve import RetrievedChunk, VectorStore, get_store
 
 logger = logging.getLogger(__name__)
 
-# Global lock so two concurrent requests can't ingest the same drug
-# twice at the same time.
 _INGEST_LOCK = threading.Lock()
 
 
@@ -77,6 +80,7 @@ class RAGResult:
     generation: Optional[GenerationResult]
     timing: StageTiming = field(default_factory=StageTiming)
     error: Optional[str] = None
+    warnings: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -86,9 +90,15 @@ class RAGResult:
             "auto_ingest": asdict(self.auto_ingest),
             "retrieved": [asdict(c) for c in self.retrieved],
             "reranked": [asdict(c) for c in self.reranked],
-            "generation": asdict(self.generation) if self.generation else None,
+            # Omit the `model` field: it carries the internal model identifier
+            # (e.g. provider/model-name) which must not be disclosed to clients.
+            "generation": (
+                {k: v for k, v in asdict(self.generation).items() if k != "model"}
+                if self.generation else None
+            ),
             "timing": asdict(self.timing),
             "error": self.error,
+            "warnings": self.warnings,
         }
 
 
@@ -101,7 +111,7 @@ class RAGPipeline:
         detector: Optional[DrugDetector] = None,
         generator: Optional[DeepSeekGenerator] = None,
         top_k_retrieve: int = 20,
-        top_k_rerank: int = 5,
+        top_k_rerank: int = 8,
         auto_ingest: bool = True,
     ):
         self.store = store or get_store()
@@ -125,10 +135,16 @@ class RAGPipeline:
         skip_generation: bool = False,
         auto_ingest: Optional[bool] = None,
         on_status: Optional[Callable[[str], None]] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+        on_missing_drugs: Optional[Callable[[List[str]], None]] = None,
         history: Optional[List[dict]] = None,
+        top_k_retrieve: Optional[int] = None,
+        top_k_rerank: Optional[int] = None,
     ) -> RAGResult:
         timing = StageTiming()
         do_ingest = self.auto_ingest if auto_ingest is None else auto_ingest
+        k_retrieve = top_k_retrieve if top_k_retrieve is not None else self.top_k_retrieve
+        k_rerank = top_k_rerank if top_k_rerank is not None else self.top_k_rerank
 
         def _status(msg: str) -> None:
             logger.info(msg)
@@ -160,6 +176,11 @@ class RAGPipeline:
             indexed = self.store.indexed_drugs()
             ai_result.missing = missing_drugs(detected, indexed)
             if ai_result.missing:
+                if on_missing_drugs is not None:
+                    try:
+                        on_missing_drugs([m.canonical for m in ai_result.missing])
+                    except Exception:  # noqa: BLE001
+                        pass
                 t0 = time.perf_counter()
                 ai_result = self._auto_ingest(ai_result, on_status=_status)
                 timing.ingest_ms = (time.perf_counter() - t0) * 1000
@@ -169,8 +190,11 @@ class RAGPipeline:
         # ----- 4. Retrieve -------------------------------------------------
         _status("Retrieving top-k from Chroma…")
         t0 = time.perf_counter()
+        scope = [m.canonical for m in detected] if detected else None
         retrieved = self.store.search(
-            redaction.redacted, top_k=self.top_k_retrieve
+            redaction.redacted,
+            top_k=k_retrieve,
+            restrict_to_drug_names=scope,
         )
         timing.retrieve_ms = (time.perf_counter() - t0) * 1000
 
@@ -178,7 +202,7 @@ class RAGPipeline:
         _status("Reranking with cross-encoder…")
         t0 = time.perf_counter()
         reranked = self.reranker.rerank(
-            redaction.redacted, retrieved, top_k=self.top_k_rerank
+            redaction.redacted, retrieved, top_k=k_rerank
         )
         timing.rerank_ms = (time.perf_counter() - t0) * 1000
 
@@ -189,10 +213,20 @@ class RAGPipeline:
             _status("Generating grounded answer with DeepSeek…")
             t0 = time.perf_counter()
             try:
-                generation = self.generator.generate(redaction.redacted, reranked, history=history)
+                if on_token is not None:
+                    generation = self.generator.generate_stream(
+                        redaction.redacted, reranked, history=history, on_token=on_token
+                    )
+                else:
+                    generation = self.generator.generate(redaction.redacted, reranked, history=history)
+            except GenerationError as exc:
+                # GenerationError already carries a safe user-facing message;
+                # the original cause has been logged inside generate().
+                logger.error("Generation failed (classified): %s", exc.safe_message)
+                error = exc.safe_message
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Generation failed")
-                error = f"{type(exc).__name__}: {exc}"
+                logger.exception("Generation failed (unclassified)")
+                error = "An unexpected error occurred. Please try again."
             timing.generate_ms = (time.perf_counter() - t0) * 1000
 
         return RAGResult(
@@ -224,9 +258,12 @@ class RAGPipeline:
             # Re-check under the lock in case a sibling request just ingested
             # the same drug.
             indexed_now = self.store.indexed_drugs()
-            still_missing = [
-                n for n in missing_names if n.lower() not in indexed_now
+            still_missing_mentions = [
+                m
+                for m in ai_result.missing
+                if m.canonical.lower() not in indexed_now
             ]
+            still_missing = [m.canonical for m in still_missing_mentions]
             if not still_missing:
                 on_status("Already covered — another request beat us to it.")
                 ai_result.ingested = missing_names
@@ -236,6 +273,7 @@ class RAGPipeline:
                     drugs=still_missing,
                     store=self.store,
                     on_progress=on_status,
+                    drug_mentions=still_missing_mentions,
                 )
                 ai_result.ingested = result.get("drugs", still_missing)
                 ai_result.added_chunks = result.get("added_chunks", 0)
@@ -246,6 +284,6 @@ class RAGPipeline:
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Auto-ingest failed")
-                ai_result.error = f"{type(exc).__name__}: {exc}"
+                ai_result.error = "Could not load drug information automatically. Results may be incomplete."
 
         return ai_result

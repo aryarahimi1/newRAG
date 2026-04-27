@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
 :root {
 	--bg-deep: #070a12;
 	--bg-panel: rgba(16, 22, 38, 0.72);
@@ -11,6 +13,23 @@
 	--danger: #fb7185;
 	--success: #4ade80;
 	--warning: #fbbf24;
+
+	/* spacing scale */
+	--space-xs: 0.25rem;
+	--space-sm: 0.5rem;
+	--space-md: 0.75rem;
+	--space-lg: 1rem;
+	--space-xl: 1.5rem;
+	--space-2xl: 2rem;
+
+	/* border-radius scale */
+	--radius-xs: 4px;
+	--radius-sm: 6px;
+	--radius-md: 10px;
+	--radius-lg: 14px;
+	--radius-xl: 20px;
+	--radius-full: 9999px;
+
 	font-family:
 		'DM Sans',
 		system-ui,
@@ -27,13 +46,57 @@
 	box-sizing: border-box;
 }
 
-html,
+html {
+	height: 100%;
+}
+
 body {
 	margin: 0;
-	min-height: 100%;
-	background: radial-gradient(1200px 800px at 10% -10%, rgba(94, 234, 212, 0.08), transparent),
+	height: 100%;
+	overflow: hidden;
+	background:
+		radial-gradient(1200px 800px at 10% -10%, rgba(94, 234, 212, 0.08), transparent),
 		radial-gradient(900px 600px at 90% 20%, rgba(244, 114, 182, 0.06), transparent),
 		var(--bg-deep);
+	position: relative;
+}
+
+/* animated background blobs */
+body::before,
+body::after {
+	content: '';
+	position: fixed;
+	inset: 0;
+	pointer-events: none;
+	z-index: 0;
+}
+
+body::before {
+	background:
+		radial-gradient(700px 500px at 15% 20%, rgba(94, 234, 212, 0.055), transparent),
+		radial-gradient(600px 400px at 80% 75%, rgba(244, 114, 182, 0.045), transparent);
+	animation: blob-drift-a 22s ease-in-out infinite alternate;
+}
+
+body::after {
+	background:
+		radial-gradient(500px 400px at 60% 10%, rgba(94, 234, 212, 0.04), transparent),
+		radial-gradient(800px 500px at 30% 80%, rgba(99, 102, 241, 0.035), transparent);
+	animation: blob-drift-b 28s ease-in-out infinite alternate;
+}
+
+@keyframes blob-drift-a {
+	0%   { transform: translate(0, 0) scale(1); }
+	33%  { transform: translate(3%, 2%) scale(1.04); }
+	66%  { transform: translate(-2%, 4%) scale(0.97); }
+	100% { transform: translate(2%, -3%) scale(1.02); }
+}
+
+@keyframes blob-drift-b {
+	0%   { transform: translate(0, 0) scale(1); }
+	40%  { transform: translate(-3%, -2%) scale(1.05); }
+	70%  { transform: translate(2%, 3%) scale(0.96); }
+	100% { transform: translate(-1%, 2%) scale(1.03); }
 }
 
 body {
@@ -44,13 +107,36 @@ body {
 a {
 	color: var(--accent);
 	text-decoration: none;
+	transition: color 0.15s, background 0.15s;
 }
 a:hover {
 	text-decoration: underline;
+	color: #7ef3e0;
 }
 
 code,
 pre {
 	font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 	font-size: 0.82rem;
+}
+
+/* scrollbar styling */
+::-webkit-scrollbar {
+	width: 5px;
+	height: 5px;
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+::-webkit-scrollbar-thumb {
+	background: rgba(94, 234, 212, 0.28);
+	border-radius: var(--radius-full);
+	transition: background 0.2s;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: rgba(94, 234, 212, 0.55);
+}
+* {
+	scrollbar-width: thin;
+	scrollbar-color: rgba(94, 234, 212, 0.28) transparent;
 }

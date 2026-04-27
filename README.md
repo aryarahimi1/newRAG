@@ -167,6 +167,32 @@ Open <http://localhost:5173>. Set `CORS_ORIGINS` in `.env` if you use another or
 
 ---
 
+## Updates & improvements
+
+### Retrieval quality
+
+- **Clinical embedding model** — swapped `BAAI/bge-base-en-v1.5` for the asymmetric `ncbi/MedCPT-Query-Encoder` / `ncbi/MedCPT-Article-Encoder` pair, trained on 255M PubMed query-article pairs. Understands regulatory language (`CYP3A4`, `concomitant use`, `AUC`) natively. Requires re-ingest.
+- **Adaptive search routing** — vector search runs first; if the top result confidence is high (score ≥ 0.75 with a clear gap to rank 4), BM25 is skipped entirely. Otherwise falls through to full hybrid RRF merge. Self-correcting — no routing rules to maintain.
+- **Source-aware chunking** — DailyMed and DrugBank use 600-char chunks (dense regulatory content, one idea per chunk); MedlinePlus uses 1000-char chunks (flowing prose). Previously all sources used a flat 2000-char limit that crammed multiple unrelated items into one chunk.
+- **Section prefix on chunks** — every stored chunk is prefixed with its FDA section name: `[Drug Interactions] ...`, `[Boxed Warning] ...`. The embedder and reranker now have an explicit section signal, not just raw text.
+- **Smart BM25 tokenizer** — replaced naive `str.split()` with a tokenizer that handles hyphenated drug names (`co-amoxiclav` → `["co-amoxiclav", "co", "amoxiclav"]`), dosage strings (`500mg` → `["500mg", "500", "mg"]`), and camelCase headers.
+- **BM25 index persistence** — index is saved to `data/chroma_db/bm25_index.pkl` after every ingest and loaded on startup. Eliminates the cold-start rebuild latency spike that previously blocked the first query after every restart.
+- **DrugBank prose serialization** — CSV rows were previously serialized as pipe-delimited key-value strings (`"key: val | key: val"`), which embed poorly. Now converted to prose sentences before embedding.
+
+### API
+
+- **SSE streaming endpoint** — `/api/chat/stream` emits Server-Sent Events: `status`, `token`, `pre_answer`, `result`, `error`, and `done` frames. The UI renders tokens as they arrive instead of waiting for the full response.
+- **Security hardening** — model identifier removed from `/api/config` (was leaking provider/model names to unauthenticated callers). Internal fields (`persist_dir`, `embedding_model`, `collection`) stripped from `/api/corpus/stats`. Raw exception details no longer surfaced to clients.
+
+### UI
+
+- **Multi-session chat** — collapsible sidebar with independent chat sessions, each maintaining its own message history, status log, and pipeline result.
+- **Streaming token display** — answer streams in word-by-word via SSE; pre-answer message shown immediately when auto-ingest triggers for an unknown drug.
+- **Design refresh** — animated background, DM Sans + JetBrains Mono fonts, custom scrollbar, spacing and border-radius design tokens.
+- **Configurable API proxy** — `VITE_API_PROXY` env var controls the backend target (defaults to `http://127.0.0.1:8000`).
+
+---
+
 ## Known limitations (worth discussing live)
 
 - **No auth / rate limits** on the API — add before any real deployment.

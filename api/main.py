@@ -7,8 +7,11 @@ on-the-fly ingests for the same drug.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import queue as _queue
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +21,7 @@ import rag._transformers_env  # noqa: F401 — before transformers
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -93,14 +97,16 @@ def health() -> dict[str, str]:
 
 @app.get("/api/config")
 def config() -> dict[str, Any]:
-    """Non-secret UI hints (model name, PII backend)."""
+    """Non-secret UI hints (PII backend availability)."""
     try:
         p = get_pipeline()
         redactor_backend = p.redactor.backend
     except Exception:  # noqa: BLE001
         redactor_backend = "unknown"
     return {
-        "openrouter_model": os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v3.2-exp"),
+        # Intentionally omit the raw model identifier — it leaks provider and
+        # model names to unauthenticated callers and was reproduced verbatim in
+        # upstream error payloads surfaced to users.
         "pii_backend": redactor_backend,
         "has_openrouter_key": bool(os.environ.get("OPENROUTER_API_KEY")),
     }
@@ -109,7 +115,15 @@ def config() -> dict[str, Any]:
 @app.get("/api/corpus/stats")
 def corpus_stats() -> dict[str, Any]:
     store = get_store()
-    return store.stats()
+    raw = store.stats()
+    # Strip fields that expose internal infrastructure details: filesystem paths,
+    # embedding model names, and collection identifiers.
+    return {
+        "n_chunks": raw.get("n_chunks"),
+        "n_sources": raw.get("n_sources"),
+        "n_drugs": raw.get("n_drugs"),
+        "drugs": raw.get("drugs", []),
+    }
 
 
 @app.post("/api/chat")
@@ -132,9 +146,6 @@ def chat(body: ChatRequest) -> dict[str, Any]:
             i += 1
 
     pipeline = get_pipeline()
-    pipeline.top_k_retrieve = body.top_k_retrieve
-    pipeline.top_k_rerank = body.top_k_rerank
-
     status_messages: List[str] = []
 
     def on_status(msg: str) -> None:
@@ -147,14 +158,111 @@ def chat(body: ChatRequest) -> dict[str, Any]:
             auto_ingest=body.auto_ingest,
             on_status=on_status,
             history=history_pairs,
+            top_k_retrieve=body.top_k_retrieve,
+            top_k_rerank=body.top_k_rerank,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Pipeline run failed")
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred. Please try again.",
+        ) from exc
 
     out = result.to_dict()
     out["status_log"] = status_messages
     return out
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(body: ChatRequest) -> StreamingResponse:
+    """SSE endpoint — emits status, token, result, and done frames."""
+    q = body.question.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Empty question")
+
+    history_pairs: List[dict[str, str]] = []
+    i = 0
+    msgs = body.history
+    while i + 1 < len(msgs):
+        if msgs[i].role == "user" and msgs[i + 1].role == "assistant":
+            history_pairs.append(
+                {"question": msgs[i].content, "answer": msgs[i + 1].content}
+            )
+            i += 2
+        else:
+            i += 1
+
+    pipeline = get_pipeline()
+    event_queue: _queue.Queue = _queue.Queue()
+
+    def run_pipeline() -> None:
+        def on_status(msg: str) -> None:
+            event_queue.put({"event": "status", "data": msg})
+
+        def on_token(token: str) -> None:
+            event_queue.put({"event": "token", "data": token})
+
+        def on_missing_drugs(drug_names: List[str]) -> None:
+            # Only emit a conversational pre-answer when the LLM will actually run.
+            if body.skip_generation:
+                return
+            pretty = ", ".join(f"**{n}**" for n in drug_names)
+            text = (
+                f"I don't have {pretty} in my knowledge base yet. "
+                f"Give me a moment — I'm reading the FDA label and patient "
+                f"education pages right now. I'll answer your question as soon "
+                f"as I'm done learning."
+            )
+            event_queue.put({"event": "pre_answer", "data": text})
+
+        try:
+            result = pipeline.run(
+                q,
+                skip_generation=body.skip_generation,
+                auto_ingest=body.auto_ingest,
+                on_status=on_status,
+                on_token=on_token if not body.skip_generation else None,
+                on_missing_drugs=on_missing_drugs,
+                history=history_pairs,
+                top_k_retrieve=body.top_k_retrieve,
+                top_k_rerank=body.top_k_rerank,
+            )
+            event_queue.put({"event": "result", "data": result.to_dict()})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Pipeline stream failed")
+            event_queue.put({"event": "error", "data": "An internal error occurred. Please try again."})
+        finally:
+            event_queue.put(None)  # sentinel — stream is done
+
+    threading.Thread(target=run_pipeline, daemon=True).start()
+
+    async def generate():
+        try:
+            while True:
+                try:
+                    item = event_queue.get_nowait()
+                except _queue.Empty:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                if item is None:
+                    break
+
+                event_type = item["event"]
+                data = json.dumps(item["data"], ensure_ascii=False)
+                yield f"event: {event_type}\ndata: {data}\n\n"
+        finally:
+            yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # Optional: serve production Svelte build from ../frontend/build

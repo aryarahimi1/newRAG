@@ -23,7 +23,10 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional
+
+if TYPE_CHECKING:
+    from rag.drug_detect import DrugMention
 from xml.etree import ElementTree as ET
 
 import requests
@@ -111,12 +114,16 @@ SECTION_KEYWORDS = [
     "PATIENT COUNSELING INFORMATION",
 ]
 
-# Chunk config per spec: ~500 tokens with 50 overlap. RecursiveCharacter-
-# TextSplitter measures in characters; 500 tokens ≈ 2000 chars as a rule of
-# thumb, so we use chunk_size=2000, chunk_overlap=200. Close enough for demo.
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=2000,
-    chunk_overlap=200,
+_clinical_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=600,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", ". ", " ", ""],
+    length_function=len,
+)
+
+_prose_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=100,
     separators=["\n\n", "\n", ". ", " ", ""],
     length_function=len,
 )
@@ -161,6 +168,30 @@ def dailymed_setids_for_drug(drug: str, limit: int = 1) -> List[str]:
         if len(seen) >= limit:
             break
     return seen
+
+
+def _ingest_search_terms(primary: str, extra: Optional[Iterable[str]] = None) -> List[str]:
+    """Ordered, lowercased search strings: canonical first, then RxNorm aliases."""
+    out: List[str] = []
+    seen: set = set()
+    for t in [primary, *(extra or ())]:
+        s = (t or "").strip().lower()
+        if len(s) < 2 or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def dailymed_setids_try_terms(
+    terms: List[str], limit: int = 1
+) -> tuple[List[str], str]:
+    """Try each search string until DailyMed returns setids. Returns (setids, term_used)."""
+    for t in terms:
+        found = dailymed_setids_for_drug(t, limit=limit)
+        if found:
+            return found, t
+    return [], ""
 
 
 def _strip_ns(tag: str) -> str:
@@ -338,17 +369,26 @@ def drugbank_fetch(drug_filter: Optional[Iterable[str]] = None) -> List[RawDoc]:
                         continue
                     if filter_set and name.lower() not in filter_set:
                         continue
-                    text_parts = [f"DrugBank ID: {row.get('DrugBank ID', '')}"]
-                    for k, v in row.items():
-                        if v and v.strip():
-                            text_parts.append(f"{k}: {v.strip()}")
+                    name_str = name
+                    dbid_str = row.get('DrugBank ID', '')
+                    desc_str = (row.get('description') or row.get('Description') or '').strip()
+                    groups_str = (row.get('groups') or row.get('Groups') or '').strip()
+
+                    prose_parts = []
+                    if desc_str:
+                        prose_parts.append(desc_str)
+                    if groups_str:
+                        prose_parts.append(f"{name_str} is classified as: {groups_str}.")
+
+                    text = f"{name_str} (DrugBank {dbid_str}). " + " ".join(prose_parts) if prose_parts else f"{name_str} (DrugBank {dbid_str})."
+
                     docs.append(
                         RawDoc(
                             source="drugbank",
-                            source_url=f"https://go.drugbank.com/drugs/{row.get('DrugBank ID', '')}",
+                            source_url=f"https://go.drugbank.com/drugs/{dbid_str}",
                             drug_name=name.lower(),
                             section="DrugBank Summary",
-                            text=" | ".join(text_parts),
+                            text=text,
                         )
                     )
         except Exception as exc:  # noqa: BLE001
@@ -407,6 +447,7 @@ def chunk_docs(raw_docs: List[RawDoc]):
     metas: List[dict] = []
     seen_ids = set()
     for doc in raw_docs:
+        splitter = _clinical_splitter if doc.source in ("dailymed", "drugbank") else _prose_splitter
         chunks = splitter.split_text(doc.text)
         for i, chunk in enumerate(chunks):
             fingerprint = hashlib.md5(
@@ -417,7 +458,7 @@ def chunk_docs(raw_docs: List[RawDoc]):
                 continue
             seen_ids.add(cid)
             ids.append(cid)
-            texts.append(chunk)
+            texts.append(f"[{doc.section}] {chunk}")
             metas.append(
                 {
                     "source": doc.source,
@@ -445,12 +486,21 @@ def ingest_drugs(
     limit_per_drug: int = 1,
     on_progress: Optional[Callable[[str], None]] = None,
     sleep_between: float = 0.2,
+    drug_mentions: Optional[Iterable["DrugMention"]] = None,
 ) -> dict:
     """Fetch, chunk, embed, and upsert the given drugs. Safe to call repeatedly."""
     store = store or VectorStore()
     drug_list = [d.strip().lower() for d in drugs if d and str(d).strip()]
     if not drug_list:
         return {"fetched_docs": 0, "added_chunks": 0, "drugs": []}
+
+    alias_map: Dict[str, tuple] = {}
+    if drug_mentions is not None:
+        from rag.drug_detect import DrugMention as _DM
+
+        for dm in drug_mentions:
+            if isinstance(dm, _DM):
+                alias_map[dm.canonical.lower()] = dm.ingest_aliases
 
     def _progress(msg: str) -> None:
         logger.info(msg)
@@ -464,16 +514,31 @@ def ingest_drugs(
 
     if use_dailymed:
         for drug in drug_list:
+            extras = alias_map.get(drug, ())
+            terms = _ingest_search_terms(drug, extras)
             _progress(f"DailyMed: fetching {drug}…")
-            setids = dailymed_setids_for_drug(drug, limit=limit_per_drug)
+            setids, via = dailymed_setids_try_terms(terms, limit=limit_per_drug)
+            if via and via != drug:
+                logger.info("DailyMed: using search term %r for canonical %r", via, drug)
             for setid in setids:
                 raw.extend(dailymed_fetch_sections(setid, drug))
                 time.sleep(sleep_between)
 
     if use_medlineplus:
         for drug in drug_list:
+            extras = alias_map.get(drug, ())
+            terms = _ingest_search_terms(drug, extras)
             _progress(f"MedlinePlus: fetching {drug}…")
-            raw.extend(medlineplus_fetch(drug))
+            got: List[RawDoc] = []
+            for t in terms:
+                got = medlineplus_fetch(t)
+                if got:
+                    if t != drug:
+                        logger.info(
+                            "MedlinePlus: matched via search term %r for %r", t, drug
+                        )
+                    break
+            raw.extend(got)
             time.sleep(sleep_between)
 
     if use_drugbank:

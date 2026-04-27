@@ -1,5 +1,9 @@
 <script lang="ts">
-	type ChatTurn = { role: 'user' | 'assistant'; content: string };
+	import { tick } from 'svelte';
+
+	type Role = 'user' | 'assistant';
+	type ChatTurn = { id: string; role: Role; content: string };
+	type StatusEntry = { id: string; text: string };
 
 	type CorpusStats = {
 		n_chunks: number;
@@ -8,6 +12,14 @@
 		embedding_model: string;
 		collection: string;
 		drugs?: string[];
+	};
+
+	type MetadataValue = string | number | boolean | null | undefined;
+	type Source = {
+		id: string;
+		text: string;
+		metadata: Record<string, MetadataValue>;
+		score: number;
 	};
 
 	type PipelineResult = {
@@ -25,8 +37,8 @@
 			error: string | null;
 			skipped: boolean;
 		};
-		retrieved: { id: string; text: string; metadata: Record<string, string>; score: number }[];
-		reranked: { id: string; text: string; metadata: Record<string, string>; score: number }[];
+		retrieved: Source[];
+		reranked: Source[];
 		generation: {
 			answer: string;
 			model: string;
@@ -38,6 +50,17 @@
 		status_log?: string[];
 	};
 
+	type ChatSession = {
+		id: string;
+		title: string;
+		createdAt: number;
+		updatedAt: number;
+		messages: ChatTurn[];
+		statusLines: StatusEntry[];
+		lastResult: PipelineResult | null;
+		requestError: string | null;
+	};
+
 	const sampleQuestions = [
 		'Can I take ibuprofen with lisinopril for my blood pressure?',
 		'Is it safe to combine warfarin and aspirin?',
@@ -47,8 +70,44 @@
 		'Does rifampin reduce the effectiveness of warfarin?'
 	];
 
-	let messages = $state<ChatTurn[]>([]);
-	let lastResult = $state<PipelineResult | null>(null);
+	let msgSeq = 0;
+	let chatSeq = 0;
+	let statusSeq = 0;
+
+	function nextMsgId() {
+		msgSeq += 1;
+		return `msg-${msgSeq}`;
+	}
+
+	function nextChatId() {
+		chatSeq += 1;
+		return `chat-${chatSeq}`;
+	}
+
+	function nextStatusId() {
+		statusSeq += 1;
+		return `status-${statusSeq}`;
+	}
+
+	function createChatSession(): ChatSession {
+		const now = Date.now();
+		return {
+			id: nextChatId(),
+			title: 'New chat',
+			createdAt: now,
+			updatedAt: now,
+			messages: [],
+			statusLines: [],
+			lastResult: null,
+			requestError: null
+		};
+	}
+
+	let initialChat = createChatSession();
+	let sessions = $state<ChatSession[]>([initialChat]);
+	let activeChatId = $state(initialChat.id);
+	let railCollapsed = $state(false);
+
 	let corpus = $state<CorpusStats | null>(null);
 	let apiConfig = $state<{
 		openrouter_model: string;
@@ -63,42 +122,139 @@
 
 	let input = $state('');
 	let loading = $state(false);
-	let errorMsg = $state<string | null>(null);
-	let statusLines = $state<string[]>([]);
+	let threadEl = $state<HTMLDivElement | undefined>(undefined);
+	let lastSentUserId = $state<string | null>(null);
+	let streamingMsgId = $state<string | null>(null);
+	let streamingPreAnswer = $state(false);
 
-	$effect(() => {
-		if (apiConfig && !apiConfig.has_openrouter_key) {
-			skipGeneration = true;
-		}
-	});
+	let activeChat = $derived(sessions.find((session) => session.id === activeChatId) ?? sessions[0]);
+	let currentMessages = $derived(activeChat?.messages ?? []);
+	let currentStatus = $derived(activeChat?.statusLines ?? []);
+	let currentResult = $derived(activeChat?.lastResult ?? null);
+	let currentError = $derived(activeChat?.requestError ?? null);
+	let latestStatus = $derived(currentStatus.at(-1)?.text ?? '');
+	let hasMessages = $derived(currentMessages.length > 0);
 
-	function segmentAnswer(text: string): { kind: 'text' | 'cite'; value: string }[] {
-		const re = /\[(\d+)\]/g;
-		const out: { kind: 'text' | 'cite'; value: string }[] = [];
-		let last = 0;
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(text)) !== null) {
-			if (m.index > last) {
-				out.push({ kind: 'text', value: text.slice(last, m.index) });
-			}
-			out.push({ kind: 'cite', value: m[1] ?? '' });
-			last = m.index + m[0].length;
-		}
-		if (last < text.length) {
-			out.push({ kind: 'text', value: text.slice(last) });
-		}
-		return out.length ? out : [{ kind: 'text', value: text }];
+	async function scrollThreadToEnd(behavior: ScrollBehavior = 'smooth') {
+		await tick();
+		threadEl?.scrollTo({ top: threadEl.scrollHeight, behavior });
+	}
+
+	function updateChat(chatId: string, updater: (session: ChatSession) => ChatSession) {
+		sessions = sessions.map((session) => (session.id === chatId ? updater(session) : session));
+	}
+
+	function setChatMessages(chatId: string, messages: ChatTurn[]) {
+		updateChat(chatId, (session) => ({ ...session, messages, updatedAt: Date.now() }));
+	}
+
+	function appendStatus(chatId: string, text: string) {
+		updateChat(chatId, (session) => ({
+			...session,
+			statusLines: [...session.statusLines, { id: nextStatusId(), text }],
+			updatedAt: Date.now()
+		}));
+	}
+
+	function statusEntries(lines: string[]): StatusEntry[] {
+		return lines.map((text) => ({ id: nextStatusId(), text }));
+	}
+
+	function titleFromQuestion(question: string) {
+		const clean = question.replace(/\s+/g, ' ').trim();
+		return clean.length > 42 ? `${clean.slice(0, 39)}...` : clean || 'New chat';
+	}
+
+	function esc(value: string): string {
+		return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	}
+
+	function inlineMarkdown(text: string): string {
+		return esc(text)
+			.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+			.replace(/_(.+?)_/g, '<em>$1</em>')
+			.replace(/\[(\d+)\]/g, '<span class="cite">[$1]</span>')
+			.replace(/\n/g, '<br>');
+	}
+
+	function renderMarkdown(text: string): string {
+		const paragraphs = text.split(/\n\n+/).filter((paragraph) => paragraph.trim());
+		if (!paragraphs.length) return esc(text);
+
+		return paragraphs
+			.map((paragraph) => {
+				const lines = paragraph.trim().split('\n');
+				const firstLine = lines[0].trim();
+				const headerMatch = firstLine.match(/^\*\*(.+?)\*\*$/);
+				if (headerMatch) {
+					const body = lines.slice(1).join('\n').trim();
+					return `<section class="md-section"><h4>${esc(headerMatch[1])}</h4>${body ? `<p>${inlineMarkdown(body)}</p>` : ''}</section>`;
+				}
+				return `<p>${inlineMarkdown(paragraph.trim())}</p>`;
+			})
+			.join('');
+	}
+
+	function messageClass(message: ChatTurn) {
+		return [
+			'message',
+			message.role,
+			message.id === lastSentUserId && 'sent-flash',
+			message.id === streamingMsgId && 'streaming',
+			message.id === streamingMsgId && streamingPreAnswer && 'pre-answer'
+		]
+			.filter(Boolean)
+			.join(' ');
+	}
+
+	function previewText(session: ChatSession) {
+		return session.messages.at(-1)?.content ?? 'No messages yet';
+	}
+
+	function formatTime(value: number) {
+		return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(value);
+	}
+
+	function formatScore(value: number | null | undefined) {
+		if (typeof value !== 'number' || Number.isNaN(value)) return 'n/a';
+		return value.toFixed(3);
+	}
+
+	function formatMs(value: number) {
+		return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${value.toFixed(0)}ms`;
+	}
+
+	function metadataLabel(source: Source) {
+		const metadata = source.metadata ?? {};
+		const label =
+			metadata.drug ??
+			metadata.title ??
+			metadata.source ??
+			metadata.source_name ??
+			metadata.url ??
+			metadata.file ??
+			source.id;
+		return String(label);
+	}
+
+	function metadataValue(value: MetadataValue) {
+		if (value === null || value === undefined) return '';
+		return String(value);
+	}
+
+	function entityTypes(result: PipelineResult) {
+		return [...new Set(result.redaction.entities.map((entity) => entity.entity_type))].join(', ');
 	}
 
 	async function loadMeta() {
 		try {
-			const [s, c] = await Promise.all([
-				fetch('/api/corpus/stats').then((r) => r.json()),
-				fetch('/api/config').then((r) => r.json())
+			const [stats, config] = await Promise.all([
+				fetch('/api/corpus/stats').then((response) => response.json()),
+				fetch('/api/config').then((response) => response.json())
 			]);
-			corpus = s;
-			apiConfig = c;
-			if (!c.has_openrouter_key) skipGeneration = true;
+			corpus = stats;
+			apiConfig = config;
+			if (!config.has_openrouter_key) skipGeneration = true;
 		} catch {
 			corpus = null;
 		}
@@ -108,38 +264,168 @@
 		void loadMeta();
 	});
 
-	function clearChat() {
-		messages = [];
-		lastResult = null;
-		errorMsg = null;
-		statusLines = [];
+	function startNewChat() {
+		const session = createChatSession();
+		sessions = [session, ...sessions];
+		activeChatId = session.id;
+		input = '';
+		void scrollThreadToEnd('auto');
 	}
 
-	function buildHistory(): ChatTurn[] {
-		const h: ChatTurn[] = [];
-		for (let i = 0; i + 1 < messages.length; i += 2) {
-			const u = messages[i];
-			const a = messages[i + 1];
-			if (u?.role === 'user' && a?.role === 'assistant') {
-				h.push(u, a);
+	function selectChat(chatId: string) {
+		activeChatId = chatId;
+		void scrollThreadToEnd('auto');
+	}
+
+	function clearActiveChat() {
+		updateChat(activeChatId, (session) => ({
+			...session,
+			title: 'New chat',
+			messages: [],
+			statusLines: [],
+			lastResult: null,
+			requestError: null,
+			updatedAt: Date.now()
+		}));
+		input = '';
+	}
+
+	function buildHistory(messages: ChatTurn[]): ChatTurn[] {
+		const history: ChatTurn[] = [];
+		for (let index = 0; index + 1 < messages.length; index += 2) {
+			const user = messages[index];
+			const assistant = messages[index + 1];
+			if (user?.role === 'user' && assistant?.role === 'assistant') {
+				history.push(user, assistant);
 			}
 		}
-		return h;
+		return history;
 	}
 
 	async function send(question: string) {
 		const q = question.trim();
-		if (!q || loading) return;
+		if (!q || loading || !activeChat) return;
 
-		errorMsg = null;
-		statusLines = [];
-		messages = [...messages, { role: 'user', content: q }];
+		const chatId = activeChat.id;
+		const previousMessages = [...activeChat.messages];
+		const userMessage: ChatTurn = { id: nextMsgId(), role: 'user', content: q };
+		const nextTitle = previousMessages.length ? activeChat.title : titleFromQuestion(q);
+
+		updateChat(chatId, (session) => ({
+			...session,
+			title: nextTitle,
+			messages: [...previousMessages, userMessage],
+			statusLines: [],
+			lastResult: null,
+			requestError: null,
+			updatedAt: Date.now()
+		}));
+
+		lastSentUserId = userMessage.id;
+		setTimeout(() => {
+			lastSentUserId = null;
+		}, 700);
+
 		input = '';
 		loading = true;
+		streamingPreAnswer = false;
+		void scrollThreadToEnd();
+
+		const history = buildHistory(previousMessages);
+		let assistantId: string | null = null;
+		let streamedContent = '';
+		let hadPreAnswer = false;
+
+		function ensureAssistantBubble() {
+			if (assistantId !== null) return;
+			assistantId = nextMsgId();
+			streamingMsgId = assistantId;
+			setChatMessages(chatId, [
+				...previousMessages,
+				userMessage,
+				{ id: assistantId, role: 'assistant', content: '' }
+			]);
+		}
+
+		function updateAssistantContent(content: string) {
+			if (assistantId === null) return;
+			updateChat(chatId, (session) => ({
+				...session,
+				messages: session.messages.map((message) =>
+					message.id === assistantId ? { ...message, content } : message
+				),
+				updatedAt: Date.now()
+			}));
+		}
+
+		function removeAssistantBubble() {
+			if (assistantId === null) return;
+			updateChat(chatId, (session) => ({
+				...session,
+				messages: session.messages.filter((message) => message.id !== assistantId),
+				updatedAt: Date.now()
+			}));
+			assistantId = null;
+		}
+
+		function handleSSEEvent(event: string, rawData: string) {
+			try {
+				const data = JSON.parse(rawData);
+
+				if (event === 'status') {
+					appendStatus(chatId, typeof data === 'string' ? data : String(data));
+				} else if (event === 'pre_answer') {
+					ensureAssistantBubble();
+					streamedContent = typeof data === 'string' ? data : String(data);
+					hadPreAnswer = true;
+					streamingPreAnswer = true;
+					updateAssistantContent(streamedContent);
+					if (activeChatId === chatId) void scrollThreadToEnd('auto');
+				} else if (event === 'token') {
+					ensureAssistantBubble();
+					if (hadPreAnswer) {
+						streamedContent = '';
+						hadPreAnswer = false;
+						streamingPreAnswer = false;
+					}
+					streamedContent += typeof data === 'string' ? data : String(data);
+					updateAssistantContent(streamedContent);
+					if (activeChatId === chatId) void scrollThreadToEnd('auto');
+				} else if (event === 'result') {
+					const result = data as PipelineResult;
+					updateChat(chatId, (session) => ({
+						...session,
+						lastResult: result,
+						statusLines: session.statusLines.length
+							? session.statusLines
+							: statusEntries(result.status_log ?? []),
+						requestError: result.error,
+						updatedAt: Date.now()
+					}));
+
+					if (!streamedContent) {
+						ensureAssistantBubble();
+						const answer =
+							result.generation?.answer ??
+							(result.error ? `_(generation failed: ${result.error})_` : '_(LLM call skipped - retrieval only)_');
+						streamedContent = answer;
+						updateAssistantContent(answer);
+					}
+
+					void loadMeta();
+					if (activeChatId === chatId) void scrollThreadToEnd('auto');
+				} else if (event === 'error') {
+					const message = typeof data === 'string' ? data : JSON.stringify(data);
+					updateChat(chatId, (session) => ({ ...session, requestError: message, updatedAt: Date.now() }));
+					if (!streamedContent) removeAssistantBubble();
+				}
+			} catch {
+				// Malformed stream frames are ignored so one bad event does not break the response.
+			}
+		}
 
 		try {
-			const history = buildHistory();
-			const res = await fetch('/api/chat', {
+			const response = await fetch('/api/chat/stream', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -151,776 +437,1197 @@
 					skip_generation: skipGeneration
 				})
 			});
-			const data = (await res.json()) as PipelineResult & { detail?: string };
-			if (!res.ok) {
-				throw new Error(typeof data.detail === 'string' ? data.detail : res.statusText);
+
+			if (!response.ok || !response.body) {
+				const errData = await response.json().catch(() => ({ detail: response.statusText }));
+				throw new Error(typeof errData.detail === 'string' ? errData.detail : response.statusText);
 			}
-			lastResult = data;
-			if (data.status_log?.length) statusLines = data.status_log;
 
-			let answerText =
-				data.generation?.answer ??
-				(data.error ? `_(generation failed: ${data.error})_` : '_(LLM call skipped — retrieval only)_');
+			const reader = response.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
 
-			messages = [...messages, { role: 'assistant', content: answerText }];
-			void loadMeta();
-		} catch (e) {
-			errorMsg = e instanceof Error ? e.message : 'Request failed';
-			messages = messages.slice(0, -1);
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+
+				const parts = buffer.split('\n\n');
+				buffer = parts.pop() ?? '';
+
+				for (const part of parts) {
+					if (!part.trim()) continue;
+
+					let event = '';
+					const dataLines: string[] = [];
+					for (const line of part.split('\n')) {
+						if (line.startsWith('event: ')) event = line.slice(7).trim();
+						else if (line.startsWith('data: ')) dataLines.push(line.slice(6));
+					}
+
+					if (event && dataLines.length) handleSSEEvent(event, dataLines.join('\n'));
+				}
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'Request failed';
+			updateChat(chatId, (session) => ({ ...session, requestError: message, updatedAt: Date.now() }));
+			if (!streamedContent) removeAssistantBubble();
 		} finally {
 			loading = false;
+			streamingMsgId = null;
+			streamingPreAnswer = false;
 		}
 	}
 
-	function onSubmit(e: Event) {
-		e.preventDefault();
+	function onSubmit(event: SubmitEvent) {
+		event.preventDefault();
 		void send(input);
 	}
 
-	function useSample(s: string) {
-		void send(s);
+	function handleComposerKeydown(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			void send(input);
+		}
 	}
 </script>
 
 <svelte:head>
-	<title>Drug Interaction RAG</title>
+	<title>Drug RAG Chat</title>
 	<meta
 		name="description"
 		content="Grounded drug interaction Q&A with PII redaction, RxNorm detection, on-the-fly ingest, and citations."
 	/>
 </svelte:head>
 
-<div class="shell">
-	<aside class="sidebar glass">
-		<div class="brand">
-			<span class="logo" aria-hidden="true">◇</span>
-			<div>
-				<h1 class="title">Drug RAG</h1>
-				<p class="tagline">DailyMed · MedlinePlus · Chroma</p>
-			</div>
+<div class={['app-shell', railCollapsed && 'rail-minimized'].filter(Boolean).join(' ')}>
+	<aside class="session-rail" aria-label="Current session chats">
+		<div class="rail-header">
+			<div class="brand-mark" aria-hidden="true">DR</div>
+			{#if !railCollapsed}
+				<div>
+					<p class="eyebrow">Drug RAG</p>
+					<h1>Session</h1>
+				</div>
+			{/if}
 		</div>
 
-		{#if corpus}
-			<section class="stats">
-				<h2>Corpus</h2>
-				<div class="stat-grid">
-					<div class="stat">
-						<span class="stat-val">{corpus.n_chunks.toLocaleString()}</span>
-						<span class="stat-lbl">chunks</span>
-					</div>
-					<div class="stat">
-						<span class="stat-val">{corpus.n_drugs}</span>
-						<span class="stat-lbl">drugs</span>
-					</div>
-					<div class="stat">
-						<span class="stat-val">{corpus.n_sources}</span>
-						<span class="stat-lbl">sources</span>
-					</div>
-				</div>
-				<p class="fineprint mono">{corpus.embedding_model}</p>
-			</section>
-		{:else}
-			<p class="fineprint">Corpus stats unavailable — is the API running?</p>
-		{/if}
+		<div class="rail-actions">
+			<button type="button" class="primary small" onclick={startNewChat} aria-label="Start a new chat">
+				<span aria-hidden="true">+</span>
+				{#if !railCollapsed}<span>New chat</span>{/if}
+			</button>
+			<button
+				type="button"
+				class="icon-button"
+				onclick={() => (railCollapsed = !railCollapsed)}
+				aria-label={railCollapsed ? 'Expand chat history' : 'Collapse chat history'}
+				aria-pressed={railCollapsed}
+			>
+				{railCollapsed ? '>' : '<'}
+			</button>
+		</div>
 
-		<section class="controls">
-			<h2>Pipeline</h2>
-			<label class="field">
-				<span>Retrieve top-k</span>
-				<input type="range" min="5" max="50" step="5" bind:value={topKRetrieve} />
-				<span class="mono">{topKRetrieve}</span>
-			</label>
-			<label class="field">
-				<span>Rerank top-k</span>
-				<input type="range" min="1" max="10" step="1" bind:value={topKRerank} />
-				<span class="mono">{topKRerank}</span>
-			</label>
-			<label class="toggle">
-				<input type="checkbox" bind:checked={autoIngest} />
-				<span
-					>Auto-ingest unknown drugs
-					<span class="hint" title="RxNorm detects names missing from Chroma; FDA + MedlinePlus fetch runs before retrieval."
-						>ⓘ</span
-					></span
-				>
-			</label>
-			<label class="toggle">
-				<input type="checkbox" bind:checked={skipGeneration} />
-				<span>Skip LLM (retrieval only)</span>
-			</label>
-		</section>
-
-		{#if apiConfig}
-			<section class="meta">
-				<p class="fineprint">PII: <span class="mono">{apiConfig.pii_backend}</span></p>
-				<p class="fineprint mono">{apiConfig.openrouter_model}</p>
-			</section>
-		{/if}
-
-		<section class="samples">
-			<h2>Try asking</h2>
-			<div class="chips">
-				{#each sampleQuestions as s}
-					<button type="button" class="chip" onclick={() => useSample(s)}>{s}</button>
+		{#if !railCollapsed}
+			<nav class="chat-list" aria-label="Chats in this session">
+				{#each sessions as session (session.id)}
+					<button
+						type="button"
+						class={['chat-tab', session.id === activeChatId && 'active'].filter(Boolean).join(' ')}
+						onclick={() => selectChat(session.id)}
+						aria-current={session.id === activeChatId ? 'page' : undefined}
+					>
+						<span class="chat-title">{session.title}</span>
+						<span class="chat-preview">{previewText(session)}</span>
+						<span class="chat-time">{formatTime(session.updatedAt)}</span>
+					</button>
 				{/each}
-			</div>
-		</section>
-
-		<button type="button" class="ghost-btn" onclick={clearChat}>Clear conversation</button>
-
-		<p class="disclaimer">
-			Educational demo only — not medical advice. Grounded in FDA / NIH public sources; always confirm with a
-			clinician.
-		</p>
+			</nav>
+		{/if}
 	</aside>
 
-	<main class="main">
-		<header class="main-head glass">
+	<main class="chat-main">
+		<header class="topbar">
 			<div>
-				<h2 class="main-title">Conversation</h2>
-				<p class="main-sub">
-					Multi-turn Q&A — PII redacted before search. Unknown drugs trigger on-the-fly ingest (RxNorm → Chroma),
-					then hybrid retrieval and reranking.
-				</p>
+				<p class="eyebrow">Grounded interaction assistant</p>
+				<h2>Ask about drug interactions</h2>
+				<p class="subtle">PII is redacted before retrieval. Answers cite FDA and NIH public sources.</p>
 			</div>
-			{#if loading}
-				<div class="pulse" role="status">Running pipeline…</div>
-			{/if}
+
+			<div class="topbar-actions">
+				{#if loading}
+					<div class="live-pill" role="status" aria-live="polite">
+						<span class="spinner" aria-hidden="true"></span>
+						<span>{latestStatus || 'Running pipeline...'}</span>
+					</div>
+				{/if}
+				<button type="button" class="ghost small" onclick={clearActiveChat} disabled={!hasMessages && !currentResult}>
+					Clear
+				</button>
+			</div>
 		</header>
 
-		{#if errorMsg}
-			<div class="banner error" role="alert">{errorMsg}</div>
+		<section class="meta-row" aria-label="Corpus and model metadata">
+			<details class="meta-card">
+				<summary>Corpus</summary>
+				{#if corpus}
+					<div class="metric-grid">
+						<div><strong>{corpus.n_chunks.toLocaleString()}</strong><span>chunks</span></div>
+						<div><strong>{corpus.n_drugs.toLocaleString()}</strong><span>drugs</span></div>
+						<div><strong>{corpus.n_sources.toLocaleString()}</strong><span>sources</span></div>
+					</div>
+					<p class="mono muted">{corpus.collection} / {corpus.embedding_model}</p>
+				{:else}
+					<p class="muted">Corpus stats unavailable. Check that the API is running.</p>
+				{/if}
+			</details>
+
+			<details class="meta-card">
+				<summary>Model &amp; privacy</summary>
+				{#if apiConfig}
+					<p><span class="muted">Generation</span> <strong>{apiConfig.openrouter_model}</strong></p>
+					<p><span class="muted">PII backend</span> <strong>{apiConfig.pii_backend}</strong></p>
+					<p class={apiConfig.has_openrouter_key ? 'ok-text' : 'warn-text'}>
+						{apiConfig.has_openrouter_key ? 'OpenRouter key available' : 'No OpenRouter key; retrieval-only mode enabled'}
+					</p>
+				{:else}
+					<p class="muted">Config unavailable.</p>
+				{/if}
+			</details>
+		</section>
+
+		{#if currentError}
+			<div class="banner error" role="alert">{currentError}</div>
 		{/if}
 
-		<div class="thread">
-			{#each messages as m, i (i)}
-				<article class="bubble {m.role}">
-					<span class="role">{m.role === 'user' ? 'You' : 'Assistant'}</span>
-					<div class="bubble-body">
-						{#if m.role === 'assistant'}
-							<p class="answer">
-								{#each segmentAnswer(m.content) as part, pi (part.kind + part.value + pi)}
-									{#if part.kind === 'cite'}
-										<span class="cite">[{part.value}]</span>
-									{:else}
-										{part.value}
-									{/if}
-								{/each}
-							</p>
-						{:else}
-							<p class="answer">{m.content}</p>
-						{/if}
+		<div class="thread" bind:this={threadEl}>
+			{#if !hasMessages}
+				<section class="empty-state">
+					<div class="empty-orb" aria-hidden="true">Rx</div>
+					<h2>Start a grounded Drug RAG chat</h2>
+					<p>
+						Ask about combinations, contraindications, alcohol warnings, or how a drug may affect another. The
+						pipeline will redact PII, detect drug names, retrieve sources, rerank citations, and stream the answer.
+					</p>
+					<div class="sample-grid" aria-label="Sample prompts">
+						{#each sampleQuestions.slice(0, 4) as sample (sample)}
+							<button type="button" class="sample-card" disabled={loading} onclick={() => send(sample)}>
+								{sample}
+							</button>
+						{/each}
 					</div>
-				</article>
-			{/each}
+				</section>
+			{:else}
+				{#each currentMessages as message (message.id)}
+					<article class={messageClass(message)}>
+						<div class="avatar" aria-hidden="true">{message.role === 'user' ? 'You' : 'AI'}</div>
+						<div class="message-content">
+							<div class="message-label">{message.role === 'user' ? 'You' : 'Drug RAG'}</div>
+							{#if message.role === 'assistant'}
+								<div class="answer-body">{@html renderMarkdown(message.content)}</div>
+							{:else}
+								<p>{message.content}</p>
+							{/if}
+						</div>
+					</article>
+				{/each}
+
+				{#if loading && !streamingMsgId}
+					<article class="message assistant pending" aria-busy="true">
+						<div class="avatar" aria-hidden="true">AI</div>
+						<div class="message-content">
+							<div class="message-label">Drug RAG</div>
+							<p class="typing">Searching sources<span aria-hidden="true">...</span></p>
+						</div>
+					</article>
+				{/if}
+			{/if}
 		</div>
 
-		{#if lastResult}
-			<div class="panels glass">
-				{#if statusLines.length}
-					<section class="panel status-panel">
-						<h3>Pipeline trace</h3>
+		{#if currentStatus.length || currentResult}
+			<section class="details-stack" aria-label="Pipeline details">
+				{#if currentStatus.length}
+					<details class="detail-panel" open={loading}>
+						<summary>Pipeline status</summary>
 						<ol class="status-list">
-							{#each statusLines as line, j}
-								<li>{line}</li>
+							{#each currentStatus as status (status.id)}
+								<li>{status.text}</li>
 							{/each}
 						</ol>
-					</section>
+					</details>
 				{/if}
 
-				<section class="panel">
-					<h3>1 · PII redaction</h3>
-					<div class="split">
-						<div>
-							<h4>Original</h4>
-							<pre class="code">{lastResult.redaction.original}</pre>
+				{#if currentResult}
+					<details class="detail-panel">
+						<summary>PII redaction</summary>
+						<div class="split">
+							<div>
+								<h3>Original</h3>
+								<pre>{currentResult.redaction.original}</pre>
+							</div>
+							<div>
+								<h3>Redacted</h3>
+								<pre>{currentResult.redaction.redacted}</pre>
+							</div>
 						</div>
-						<div>
-							<h4>Redacted</h4>
-							<pre class="code">{lastResult.redaction.redacted}</pre>
-						</div>
-					</div>
-					{#if lastResult.redaction.entities?.length}
-						<p class="note warn">
-							Detected {lastResult.redaction.entities.length} PII entit{lastResult.redaction.entities.length === 1
-								? 'y'
-								: 'ies'}: {[...new Set(lastResult.redaction.entities.map((e) => e.entity_type))].join(', ')}
-						</p>
-					{:else}
-						<p class="note ok">No PII detected.</p>
-					{/if}
-				</section>
-
-				<section class="panel">
-					<h3>2 · Drug detection &amp; auto-ingest</h3>
-					{#if !lastResult.detected_drugs?.length}
-						<p class="note">No RxNorm drug hits — retrieval runs over the full corpus.</p>
-					{:else}
-						<div class="drug-row">
-							{#each lastResult.detected_drugs as d}
-								<div class="drug-card">
-									<strong>{d.canonical}</strong>
-									<span class="fineprint mono">RxCUI {d.rxcui} · {d.score.toFixed(0)}/100</span>
-								</div>
-							{/each}
-						</div>
-					{/if}
-					{#if lastResult.auto_ingest.skipped}
-						<p class="fineprint">Auto-ingest disabled.</p>
-					{:else if lastResult.auto_ingest.missing?.length}
-						{#if lastResult.auto_ingest.added_chunks > 0}
-							<p class="note ok">
-								Learned {#each lastResult.auto_ingest.missing as m, idx}{idx > 0 ? ', ' : ''}<strong
-									>{m.canonical}</strong
-								>{/each} on the fly — added {lastResult.auto_ingest.added_chunks} chunks to Chroma.
+						{#if currentResult.redaction.entities.length}
+							<p class="note warn">
+								Detected {currentResult.redaction.entities.length} PII entities: {entityTypes(currentResult)}
 							</p>
-						{:else if lastResult.auto_ingest.error}
-							<p class="note warn">Ingest note: {lastResult.auto_ingest.error}</p>
 						{:else}
-							<p class="note">Tried to ingest missing drugs but no upstream documents returned.</p>
+							<p class="note ok">No PII entities detected.</p>
 						{/if}
-					{:else}
-						<p class="fineprint">All detected drugs already indexed.</p>
-					{/if}
-				</section>
+					</details>
 
-				<section class="panel">
-					<h3>3 · Answer</h3>
-					{#if lastResult.error}
-						<p class="note err">Generation failed: {lastResult.error}</p>
-					{:else if lastResult.generation}
-						<p class="fineprint mono">
-							{lastResult.generation.model}
-							{#if lastResult.generation.prompt_tokens != null}
-								· {lastResult.generation.prompt_tokens} prompt / {lastResult.generation.completion_tokens}
-								completion tokens
+					<details class="detail-panel">
+						<summary>Drug detection &amp; auto-ingest</summary>
+						{#if currentResult.detected_drugs.length}
+							<div class="pill-list">
+								{#each currentResult.detected_drugs as drug (`${drug.mention}-${drug.rxcui}`)}
+									<span class="data-pill">
+										<strong>{drug.canonical}</strong>
+										<small>{drug.mention} / RxCUI {drug.rxcui} / {formatScore(drug.score)}</small>
+									</span>
+								{/each}
+							</div>
+						{:else}
+							<p class="muted">No drug names were detected.</p>
+						{/if}
+
+						<div class="ingest-box">
+							<p><strong>{currentResult.auto_ingest.skipped ? 'Auto-ingest skipped' : 'Auto-ingest checked'}</strong></p>
+							<p class="muted">
+								{currentResult.auto_ingest.ingested.length
+									? `Ingested ${currentResult.auto_ingest.ingested.join(', ')}`
+									: 'No new drug documents were ingested.'}
+							</p>
+							{#if currentResult.auto_ingest.added_chunks}
+								<p class="ok-text">Added {currentResult.auto_ingest.added_chunks} chunks.</p>
 							{/if}
-						</p>
-					{:else}
-						<p class="note">LLM skipped.</p>
-					{/if}
-				</section>
-
-				<section class="panel">
-					<h3>4 · Citations (reranked)</h3>
-					{#if !lastResult.reranked?.length}
-						<p class="note">No passages retrieved.</p>
-					{:else}
-						<div class="citations">
-							{#each lastResult.reranked as c, idx (c.id)}
-								<details class="cite-card" open={idx === 0}>
-									<summary>
-										<span class="badge">{idx + 1}</span>
-										<span class="cite-title"
-											>{c.metadata?.drug_name ?? 'unknown'} — {c.metadata?.section ?? ''} · {c.score.toFixed(
-												3
-											)}</span
-										>
-									</summary>
-									{#if c.metadata?.source_url}
-										<p class="fineprint">
-											<a href={c.metadata.source_url} target="_blank" rel="noreferrer"
-												>{c.metadata.source ?? c.metadata.source_url}</a
-											>
-										</p>
-									{/if}
-									<pre class="chunk">{c.text}</pre>
-								</details>
-							{/each}
-						</div>
-					{/if}
-				</section>
-
-				<section class="panel">
-					<details>
-						<summary>Debug: pre-rerank + timings</summary>
-						<pre class="code mono">{JSON.stringify(
-								{
-									redact_ms: Math.round(lastResult.timing.redact_ms * 10) / 10,
-									detect_ms: Math.round(lastResult.timing.detect_ms * 10) / 10,
-									ingest_ms: Math.round(lastResult.timing.ingest_ms * 10) / 10,
-									retrieve_ms: Math.round(lastResult.timing.retrieve_ms * 10) / 10,
-									rerank_ms: Math.round(lastResult.timing.rerank_ms * 10) / 10,
-									generate_ms: Math.round(lastResult.timing.generate_ms * 10) / 10,
-									total_ms: Math.round(lastResult.timing.total_ms * 10) / 10
-								},
-								null,
-								2
-							)}</pre>
-						<div class="citations">
-							{#each lastResult.retrieved as c, idx}
-								<div class="cite-card flat">
-									<span class="badge dim">R{idx + 1}</span>
-									<span class="cite-title">{c.score.toFixed(3)} · {c.metadata?.drug_name}</span>
-									<pre class="chunk">{c.text}</pre>
-								</div>
-							{/each}
+							{#if currentResult.auto_ingest.error}
+								<p class="warn-text">{currentResult.auto_ingest.error}</p>
+							{/if}
 						</div>
 					</details>
-				</section>
-			</div>
+
+					<details class="detail-panel" open>
+						<summary>Citations &amp; reranked sources</summary>
+						{#if currentResult.reranked.length}
+							<div class="source-list">
+								{#each currentResult.reranked as source (source.id)}
+									<article class="source-card">
+										<div class="source-head">
+											<strong>{metadataLabel(source)}</strong>
+											<span class="score">score {formatScore(source.score)}</span>
+										</div>
+										<p>{source.text}</p>
+										<div class="metadata">
+											{#each Object.entries(source.metadata ?? {}) as [key, value] (`${source.id}-${key}`)}
+												{#if metadataValue(value)}
+													<span>{key}: {metadataValue(value)}</span>
+												{/if}
+											{/each}
+										</div>
+									</article>
+								{/each}
+							</div>
+						{:else}
+							<p class="muted">No reranked sources returned.</p>
+						{/if}
+					</details>
+
+					<details class="detail-panel">
+						<summary>Generation &amp; timing</summary>
+						{#if currentResult.generation}
+							<div class="metric-grid">
+								<div><strong>{currentResult.generation.model}</strong><span>model</span></div>
+								<div><strong>{currentResult.generation.prompt_tokens ?? 'n/a'}</strong><span>prompt tokens</span></div>
+								<div>
+									<strong>{currentResult.generation.completion_tokens ?? 'n/a'}</strong><span>completion tokens</span>
+								</div>
+							</div>
+						{:else}
+							<p class="muted">Generation skipped or unavailable.</p>
+						{/if}
+
+						{#if Object.keys(currentResult.timing ?? {}).length}
+							<div class="timing-grid">
+								{#each Object.entries(currentResult.timing) as [name, value] (name)}
+									<div><span>{name}</span><strong>{formatMs(value)}</strong></div>
+								{/each}
+							</div>
+						{/if}
+					</details>
+				{/if}
+			</section>
 		{/if}
 
-		<form class="composer glass" onsubmit={onSubmit}>
-			<input
-				class="composer-input"
-				type="text"
-				placeholder="Ask about drug interactions…"
-				bind:value={input}
-				disabled={loading}
-				autocomplete="off"
-			/>
-			<button type="submit" class="send" disabled={loading || !input.trim()}>Send</button>
+		<form class="composer" onsubmit={onSubmit}>
+			<div class="composer-main">
+				<label class="sr-only" for="question-input">Ask a drug interaction question</label>
+				<textarea
+					id="question-input"
+					bind:value={input}
+					onkeydown={handleComposerKeydown}
+					placeholder="Ask about a drug combination..."
+					rows="2"
+					disabled={loading}
+				></textarea>
+				<button type="submit" class="primary send" disabled={loading || !input.trim()}>
+					{loading ? 'Running' : 'Send'}
+				</button>
+			</div>
+
+			<div class="composer-footer">
+				<details class="composer-drawer">
+					<summary>Controls</summary>
+					<div class="control-grid">
+						<label>
+							<span>Retrieve top-k</span>
+							<input type="range" min="5" max="50" step="5" bind:value={topKRetrieve} />
+							<output>{topKRetrieve}</output>
+						</label>
+						<label>
+							<span>Rerank top-k</span>
+							<input type="range" min="1" max="10" step="1" bind:value={topKRerank} />
+							<output>{topKRerank}</output>
+						</label>
+						<label class="check-row">
+							<input type="checkbox" bind:checked={autoIngest} />
+							<span>Auto-ingest unknown drugs</span>
+						</label>
+						<label class="check-row">
+							<input
+								type="checkbox"
+								bind:checked={skipGeneration}
+								disabled={apiConfig?.has_openrouter_key === false}
+							/>
+							<span>Skip LLM</span>
+						</label>
+					</div>
+				</details>
+
+				<details class="composer-drawer samples-drawer">
+					<summary>Samples</summary>
+					<div class="sample-strip">
+						{#each sampleQuestions as sample (sample)}
+							<button type="button" disabled={loading} onclick={() => send(sample)}>{sample}</button>
+						{/each}
+					</div>
+				</details>
+			</div>
 		</form>
+
+		<p class="disclaimer">
+			Educational demo only. This is not medical advice; confirm decisions with a clinician or pharmacist.
+		</p>
 	</main>
 </div>
 
 <style>
-	.shell {
-		display: grid;
-		grid-template-columns: minmax(280px, 340px) 1fr;
+	:global(body) {
+		overflow: hidden;
+	}
+
+	.app-shell {
 		min-height: 100vh;
-		gap: 0;
-	}
-	@media (max-width: 960px) {
-		.shell {
-			grid-template-columns: 1fr;
-		}
-		.sidebar {
-			border-right: none;
-			border-bottom: 1px solid var(--border);
-		}
+		display: grid;
+		grid-template-columns: 18rem minmax(0, 1fr);
+		background:
+			radial-gradient(circle at top left, rgba(94, 234, 212, 0.14), transparent 34rem),
+			radial-gradient(circle at bottom right, rgba(96, 165, 250, 0.12), transparent 30rem),
+			#070a12;
+		color: #eef4ff;
 	}
 
-	.glass {
-		background: var(--bg-panel);
-		backdrop-filter: blur(16px);
-		border: 1px solid var(--border);
+	.app-shell.rail-minimized {
+		grid-template-columns: 5.25rem minmax(0, 1fr);
 	}
 
-	.sidebar {
-		padding: 1.5rem;
+	.session-rail {
+		border-right: 1px solid rgba(148, 163, 184, 0.16);
+		background: rgba(9, 14, 26, 0.78);
+		backdrop-filter: blur(18px);
+		padding: 1rem;
 		display: flex;
 		flex-direction: column;
-		gap: 1.25rem;
-		border-right: 1px solid var(--border);
+		gap: 1rem;
+		min-width: 0;
 	}
 
-	.brand {
+	.rail-header,
+	.rail-actions,
+	.topbar,
+	.topbar-actions,
+	.composer-main,
+	.composer-footer,
+	.source-head {
 		display: flex;
-		gap: 0.75rem;
 		align-items: center;
 	}
-	.logo {
-		font-size: 1.75rem;
-		color: var(--accent);
-		text-shadow: 0 0 24px var(--accent-dim);
-	}
-	.title {
-		margin: 0;
-		font-size: 1.35rem;
-		font-weight: 700;
-		letter-spacing: -0.02em;
-	}
-	.tagline {
-		margin: 0.15rem 0 0;
-		font-size: 0.78rem;
-		color: var(--text-muted);
+
+	.rail-header {
+		gap: 0.75rem;
+		min-height: 3rem;
 	}
 
-	h2,
-	h3,
-	h4 {
-		margin: 0 0 0.5rem;
-		font-size: 0.72rem;
+	.brand-mark,
+	.avatar,
+	.empty-orb {
+		display: grid;
+		place-items: center;
+		border-radius: 999px;
+		background: linear-gradient(135deg, rgba(94, 234, 212, 0.22), rgba(96, 165, 250, 0.18));
+		border: 1px solid rgba(148, 163, 184, 0.22);
+		color: #b7fff1;
+		font-weight: 800;
+	}
+
+	.brand-mark {
+		width: 2.75rem;
+		height: 2.75rem;
+		flex: 0 0 auto;
+	}
+
+	.eyebrow {
+		margin: 0;
+		color: #5eead4;
 		text-transform: uppercase;
 		letter-spacing: 0.12em;
-		color: var(--text-muted);
-		font-weight: 600;
-	}
-	h3 {
-		font-size: 0.8rem;
-		margin-bottom: 0.75rem;
-		color: var(--accent);
-	}
-
-	.stats .stat-grid {
-		display: grid;
-		grid-template-columns: repeat(3, 1fr);
-		gap: 0.5rem;
-	}
-	.stat {
-		background: var(--bg-elevated);
-		border-radius: 10px;
-		padding: 0.6rem 0.5rem;
-		text-align: center;
-		border: 1px solid var(--border);
-	}
-	.stat-val {
-		display: block;
-		font-weight: 700;
-		font-size: 1.1rem;
-		color: var(--accent-hot);
-	}
-	.stat-lbl {
-		font-size: 0.65rem;
-		color: var(--text-muted);
-		text-transform: uppercase;
-	}
-
-	.field {
-		display: grid;
-		grid-template-columns: 1fr auto;
-		gap: 0.35rem 0.75rem;
-		align-items: center;
-		font-size: 0.82rem;
-		margin-bottom: 0.65rem;
-	}
-	.field span:first-child {
-		grid-column: 1 / -1;
-		color: var(--text-muted);
-	}
-	.field input[type='range'] {
-		grid-column: 1 / 2;
-		width: 100%;
-		accent-color: var(--accent);
-	}
-
-	.toggle {
-		display: flex;
-		align-items: flex-start;
-		gap: 0.5rem;
-		font-size: 0.84rem;
-		margin-bottom: 0.5rem;
-		cursor: pointer;
-	}
-	.toggle input {
-		margin-top: 0.2rem;
-		accent-color: var(--accent);
-	}
-	.hint {
-		cursor: help;
-		opacity: 0.6;
-	}
-
-	.chips {
-		display: flex;
-		flex-direction: column;
-		gap: 0.4rem;
-		max-height: 220px;
-		overflow-y: auto;
-	}
-	.chip {
-		text-align: left;
-		font: inherit;
-		font-size: 0.78rem;
-		padding: 0.45rem 0.55rem;
-		border-radius: 8px;
-		border: 1px solid var(--border);
-		background: var(--bg-elevated);
-		color: var(--text);
-		cursor: pointer;
-		transition:
-			border-color 0.15s,
-			background 0.15s;
-	}
-	.chip:hover {
-		border-color: var(--accent);
-		background: var(--accent-dim);
-	}
-
-	.ghost-btn {
-		margin-top: auto;
-		font: inherit;
-		font-size: 0.82rem;
-		padding: 0.55rem;
-		border-radius: 8px;
-		border: 1px dashed var(--border);
-		background: transparent;
-		color: var(--text-muted);
-		cursor: pointer;
-	}
-	.ghost-btn:hover {
-		color: var(--text);
-		border-color: var(--text-muted);
-	}
-
-	.disclaimer {
 		font-size: 0.72rem;
-		color: var(--text-muted);
-		line-height: 1.4;
+		font-weight: 800;
+	}
+
+	h1,
+	h2,
+	h3,
+	p {
+		margin-top: 0;
+	}
+
+	.rail-header h1,
+	.topbar h2 {
 		margin: 0;
 	}
 
-	.main {
+	.rail-actions {
+		gap: 0.5rem;
+	}
+
+	button,
+	summary {
+		font: inherit;
+	}
+
+	button {
+		border: 0;
+		cursor: pointer;
+	}
+
+	button:disabled {
+		cursor: not-allowed;
+		opacity: 0.55;
+	}
+
+	.primary,
+	.ghost,
+	.icon-button,
+	.chat-tab,
+	.sample-card,
+	.sample-strip button {
+		border-radius: 999px;
+		transition:
+			transform 0.16s ease,
+			border-color 0.16s ease,
+			background 0.16s ease;
+	}
+
+	.primary {
+		background: #5eead4;
+		color: #03110f;
+		font-weight: 800;
+		padding: 0.8rem 1.05rem;
+	}
+
+	.primary:hover:not(:disabled),
+	.ghost:hover:not(:disabled),
+	.icon-button:hover,
+	.chat-tab:hover,
+	.sample-card:hover:not(:disabled),
+	.sample-strip button:hover:not(:disabled) {
+		transform: translateY(-1px);
+	}
+
+	.small {
+		padding: 0.62rem 0.85rem;
+	}
+
+	.rail-actions .primary {
+		flex: 1;
+		display: inline-flex;
+		justify-content: center;
+		gap: 0.4rem;
+	}
+
+	.icon-button,
+	.ghost {
+		border: 1px solid rgba(148, 163, 184, 0.18);
+		background: rgba(15, 23, 42, 0.72);
+		color: #e2e8f0;
+	}
+
+	.icon-button {
+		width: 2.45rem;
+		height: 2.45rem;
+	}
+
+	.chat-list {
 		display: flex;
 		flex-direction: column;
-		min-height: 100vh;
-		padding: 1rem 1.25rem 1.25rem;
-		gap: 1rem;
+		gap: 0.55rem;
+		overflow: auto;
+		padding-right: 0.15rem;
 	}
 
-	.main-head {
-		padding: 1rem 1.25rem;
-		border-radius: 14px;
-		display: flex;
+	.chat-tab {
+		text-align: left;
+		display: grid;
+		gap: 0.25rem;
+		padding: 0.8rem;
+		color: #dbeafe;
+		background: rgba(15, 23, 42, 0.58);
+		border: 1px solid rgba(148, 163, 184, 0.12);
+	}
+
+	.chat-tab.active {
+		background: rgba(20, 184, 166, 0.14);
+		border-color: rgba(94, 234, 212, 0.42);
+	}
+
+	.chat-title,
+	.chat-preview {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.chat-title {
+		font-weight: 800;
+	}
+
+	.chat-preview,
+	.chat-time,
+	.subtle,
+	.muted,
+	.disclaimer {
+		color: #94a3b8;
+	}
+
+	.chat-preview,
+	.chat-time {
+		font-size: 0.8rem;
+	}
+
+	.chat-main {
+		height: 100vh;
+		min-width: 0;
+		display: grid;
+		grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
+		gap: 0.85rem;
+		padding: 1.1rem;
+	}
+
+	.topbar {
 		justify-content: space-between;
-		align-items: flex-start;
 		gap: 1rem;
-		flex-wrap: wrap;
-	}
-	.main-title {
-		margin: 0;
-		font-size: 1.25rem;
-		font-weight: 600;
-		letter-spacing: -0.02em;
-	}
-	.main-sub {
-		margin: 0.35rem 0 0;
-		font-size: 0.85rem;
-		color: var(--text-muted);
-		max-width: 62ch;
 	}
 
-	.pulse {
-		font-size: 0.82rem;
-		color: var(--accent);
-		animation: glow 1.2s ease-in-out infinite alternate;
+	.topbar h2 {
+		font-size: clamp(1.45rem, 2vw, 2.2rem);
 	}
-	@keyframes glow {
-		from {
-			opacity: 0.5;
-		}
+
+	.topbar .subtle {
+		margin: 0.25rem 0 0;
+	}
+
+	.topbar-actions {
+		gap: 0.65rem;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+	}
+
+	.live-pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0.55rem 0.75rem;
+		border-radius: 999px;
+		background: rgba(94, 234, 212, 0.12);
+		color: #c8fff6;
+		border: 1px solid rgba(94, 234, 212, 0.24);
+		max-width: min(32rem, 52vw);
+	}
+
+	.live-pill span:last-child {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.spinner {
+		width: 0.9rem;
+		height: 0.9rem;
+		border-radius: 999px;
+		border: 2px solid rgba(94, 234, 212, 0.3);
+		border-top-color: #5eead4;
+		animation: spin 0.8s linear infinite;
+		flex: 0 0 auto;
+	}
+
+	@keyframes spin {
 		to {
-			opacity: 1;
+			transform: rotate(360deg);
 		}
+	}
+
+	.meta-row {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.8rem;
+	}
+
+	.meta-card,
+	.detail-panel,
+	.composer {
+		border: 1px solid rgba(148, 163, 184, 0.16);
+		background: rgba(15, 23, 42, 0.68);
+		box-shadow: 0 18px 60px rgba(0, 0, 0, 0.24);
+		backdrop-filter: blur(18px);
+	}
+
+	.meta-card,
+	.detail-panel {
+		border-radius: 1.1rem;
+		padding: 0.9rem;
+	}
+
+	summary {
+		cursor: pointer;
+		font-weight: 800;
+		color: #f8fafc;
+	}
+
+	.metric-grid {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 0.65rem;
+		margin-top: 0.85rem;
+	}
+
+	.metric-grid div {
+		padding: 0.65rem;
+		border-radius: 0.8rem;
+		background: rgba(2, 6, 23, 0.35);
+		border: 1px solid rgba(148, 163, 184, 0.1);
+		display: grid;
+		gap: 0.2rem;
+	}
+
+	.metric-grid strong {
+		overflow-wrap: anywhere;
+	}
+
+	.metric-grid span {
+		color: #94a3b8;
+		font-size: 0.78rem;
+	}
+
+	.mono,
+	pre {
+		font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 	}
 
 	.banner {
-		padding: 0.65rem 1rem;
-		border-radius: 10px;
-		font-size: 0.88rem;
+		border-radius: 0.9rem;
+		padding: 0.8rem 1rem;
 	}
+
 	.banner.error {
 		background: rgba(251, 113, 133, 0.12);
-		border: 1px solid rgba(251, 113, 133, 0.35);
+		border: 1px solid rgba(251, 113, 133, 0.3);
 		color: #fecdd3;
 	}
 
 	.thread {
-		flex: 1;
-		display: flex;
-		flex-direction: column;
-		gap: 0.85rem;
-		overflow-y: auto;
-		padding-bottom: 0.5rem;
+		min-height: 0;
+		overflow: auto;
+		padding: 0.4rem 0.25rem 1rem;
+		scroll-behavior: smooth;
 	}
 
-	.bubble {
-		max-width: min(720px, 100%);
-		align-self: flex-start;
-		padding: 0.85rem 1rem;
-		border-radius: 14px 14px 14px 4px;
-		background: var(--bg-elevated);
-		border: 1px solid var(--border);
-	}
-	.bubble.user {
-		align-self: flex-end;
-		border-radius: 14px 14px 4px 14px;
-		background: linear-gradient(135deg, rgba(94, 234, 212, 0.12), rgba(244, 114, 182, 0.08));
-	}
-	.role {
-		font-size: 0.65rem;
-		text-transform: uppercase;
-		letter-spacing: 0.14em;
-		color: var(--text-muted);
-	}
-	.answer {
-		margin: 0.35rem 0 0;
-		white-space: pre-wrap;
-		font-size: 0.95rem;
-	}
-	.cite {
-		display: inline-block;
-		margin: 0 0.1rem;
-		padding: 0.05rem 0.35rem;
-		border-radius: 4px;
-		background: var(--accent-dim);
-		color: var(--accent);
-		font-weight: 600;
-		font-size: 0.85em;
-		vertical-align: baseline;
-	}
-
-	.panels {
-		border-radius: 14px;
-		padding: 1rem 1.15rem;
-		display: flex;
-		flex-direction: column;
-		gap: 1.25rem;
-		max-height: 48vh;
-		overflow-y: auto;
-	}
-	.panel h4 {
-		font-size: 0.68rem;
-		margin-top: 0.5rem;
-	}
-	.split {
+	.empty-state {
+		min-height: 100%;
 		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 0.75rem;
+		align-content: center;
+		justify-items: center;
+		text-align: center;
+		gap: 1rem;
+		max-width: 56rem;
+		margin: 0 auto;
+		padding: 2rem 1rem;
 	}
-	@media (max-width: 700px) {
-		.split {
-			grid-template-columns: 1fr;
+
+	.empty-orb {
+		width: 4.2rem;
+		height: 4.2rem;
+	}
+
+	.empty-state h2 {
+		margin: 0;
+		font-size: clamp(1.8rem, 4vw, 3.4rem);
+		letter-spacing: -0.05em;
+	}
+
+	.empty-state p {
+		max-width: 43rem;
+		color: #b6c2d4;
+	}
+
+	.sample-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.75rem;
+		width: min(100%, 46rem);
+	}
+
+	.sample-card,
+	.sample-strip button {
+		color: #dbeafe;
+		background: rgba(15, 23, 42, 0.72);
+		border: 1px solid rgba(148, 163, 184, 0.16);
+	}
+
+	.sample-card {
+		border-radius: 1rem;
+		padding: 0.9rem;
+		text-align: left;
+	}
+
+	.message {
+		display: grid;
+		grid-template-columns: 2.5rem minmax(0, 1fr);
+		gap: 0.8rem;
+		max-width: 58rem;
+		margin: 0 auto 1rem;
+	}
+
+	.message.user {
+		max-width: 50rem;
+		margin-left: auto;
+		margin-right: max(0rem, calc((100% - 58rem) / 2));
+	}
+
+	.avatar {
+		width: 2.5rem;
+		height: 2.5rem;
+		font-size: 0.78rem;
+	}
+
+	.message.user .avatar {
+		background: rgba(96, 165, 250, 0.2);
+		color: #bfdbfe;
+	}
+
+	.message-content {
+		border-radius: 1.2rem;
+		padding: 0.9rem 1rem;
+		background: rgba(15, 23, 42, 0.78);
+		border: 1px solid rgba(148, 163, 184, 0.14);
+	}
+
+	.message.user .message-content {
+		background: rgba(37, 99, 235, 0.18);
+		border-color: rgba(96, 165, 250, 0.26);
+	}
+
+	.message.pre-answer .message-content {
+		border-color: rgba(251, 191, 36, 0.32);
+	}
+
+	.message-label {
+		color: #94a3b8;
+		font-size: 0.78rem;
+		font-weight: 800;
+		margin-bottom: 0.35rem;
+	}
+
+	.message-content p {
+		margin: 0;
+		white-space: pre-wrap;
+	}
+
+	.answer-body :global(p) {
+		margin: 0 0 0.85rem;
+	}
+
+	.answer-body :global(p:last-child) {
+		margin-bottom: 0;
+	}
+
+	.answer-body :global(.cite) {
+		color: #5eead4;
+		font-weight: 800;
+	}
+
+	.answer-body :global(.md-section h4) {
+		margin: 0 0 0.35rem;
+		color: #e0f2fe;
+	}
+
+	.typing {
+		color: #b6c2d4;
+	}
+
+	.sent-flash .message-content {
+		animation: flash 0.7s ease;
+	}
+
+	@keyframes flash {
+		0% {
+			box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.35);
+		}
+		100% {
+			box-shadow: 0 0 0 14px rgba(94, 234, 212, 0);
 		}
 	}
-	.code {
-		margin: 0;
-		padding: 0.65rem;
-		border-radius: 8px;
-		background: rgba(0, 0, 0, 0.35);
-		border: 1px solid var(--border);
-		overflow-x: auto;
-		white-space: pre-wrap;
-		word-break: break-word;
-	}
-	.note {
-		margin: 0.5rem 0 0;
-		font-size: 0.86rem;
-	}
-	.note.ok {
-		color: var(--success);
-	}
-	.note.warn {
-		color: var(--warning);
-	}
-	.note.err {
-		color: var(--danger);
+
+	.details-stack {
+		display: grid;
+		gap: 0.65rem;
+		max-height: 34vh;
+		overflow: auto;
+		padding-right: 0.2rem;
 	}
 
-	.drug-row {
+	.detail-panel {
+		padding: 0.85rem 1rem;
+	}
+
+	.detail-panel > :global(*:not(summary):first-of-type) {
+		margin-top: 0.85rem;
+	}
+
+	.split {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.8rem;
+	}
+
+	pre {
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		border-radius: 0.8rem;
+		padding: 0.8rem;
+		color: #dbeafe;
+		background: rgba(2, 6, 23, 0.5);
+		border: 1px solid rgba(148, 163, 184, 0.12);
+	}
+
+	.note {
+		border-radius: 0.8rem;
+		padding: 0.7rem;
+		margin-bottom: 0;
+	}
+
+	.ok,
+	.ok-text {
+		color: #86efac;
+	}
+
+	.warn,
+	.warn-text {
+		color: #fcd34d;
+	}
+
+	.pill-list,
+	.metadata,
+	.sample-strip {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.5rem;
 	}
-	.drug-card {
+
+	.data-pill,
+	.metadata span {
+		border-radius: 999px;
+		border: 1px solid rgba(148, 163, 184, 0.14);
+		background: rgba(2, 6, 23, 0.36);
 		padding: 0.45rem 0.65rem;
-		border-radius: 8px;
-		border: 1px solid var(--border);
-		background: rgba(0, 0, 0, 0.25);
-		display: flex;
-		flex-direction: column;
-		gap: 0.15rem;
 	}
 
-	.citations {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
+	.data-pill {
+		display: grid;
+		gap: 0.1rem;
 	}
-	.cite-card {
-		border: 1px solid var(--border);
-		border-radius: 10px;
-		padding: 0.5rem 0.65rem;
-		background: rgba(0, 0, 0, 0.2);
+
+	.data-pill small {
+		color: #94a3b8;
 	}
-	.cite-card.flat {
-		padding-top: 0.65rem;
+
+	.ingest-box,
+	.source-card {
+		border-radius: 0.95rem;
+		padding: 0.85rem;
+		background: rgba(2, 6, 23, 0.34);
+		border: 1px solid rgba(148, 163, 184, 0.12);
+		margin-top: 0.8rem;
 	}
-	.cite-card summary {
-		cursor: pointer;
-		list-style: none;
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		font-weight: 500;
+
+	.source-list {
+		display: grid;
+		gap: 0.7rem;
 	}
-	.cite-card summary::-webkit-details-marker {
-		display: none;
+
+	.source-head {
+		justify-content: space-between;
+		gap: 1rem;
 	}
-	.badge {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		min-width: 1.5rem;
-		height: 1.5rem;
-		border-radius: 6px;
-		background: var(--accent);
-		color: #042f2e;
-		font-size: 0.75rem;
-		font-weight: 700;
-	}
-	.badge.dim {
-		background: var(--text-muted);
-		color: var(--bg-deep);
-	}
-	.cite-title {
+
+	.score {
+		color: #5eead4;
 		font-size: 0.82rem;
 	}
-	.chunk {
-		margin: 0.5rem 0 0;
+
+	.metadata {
+		margin-top: 0.65rem;
+	}
+
+	.metadata span {
+		color: #b6c2d4;
 		font-size: 0.78rem;
-		white-space: pre-wrap;
-		word-break: break-word;
-		max-height: 200px;
-		overflow-y: auto;
 	}
 
-	.status-panel h3 {
-		color: var(--accent-hot);
-	}
 	.status-list {
-		margin: 0;
-		padding-left: 1.1rem;
-		font-size: 0.82rem;
-		color: var(--text-muted);
+		margin-bottom: 0;
+		color: #cbd5e1;
+	}
+
+	.status-list li + li {
+		margin-top: 0.4rem;
+	}
+
+	.timing-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+		gap: 0.55rem;
+		margin-top: 0.85rem;
+	}
+
+	.timing-grid div {
+		display: flex;
+		justify-content: space-between;
+		gap: 0.75rem;
+		padding: 0.55rem 0.65rem;
+		border-radius: 0.75rem;
+		background: rgba(2, 6, 23, 0.36);
 	}
 
 	.composer {
-		display: flex;
-		gap: 0.65rem;
-		padding: 0.55rem 0.65rem;
-		border-radius: 12px;
-		margin-top: auto;
-	}
-	.composer-input {
-		flex: 1;
-		border: none;
-		background: rgba(0, 0, 0, 0.35);
-		border-radius: 8px;
-		padding: 0.65rem 0.85rem;
-		color: var(--text);
-		font: inherit;
-		font-size: 0.95rem;
-		outline: none;
-		border: 1px solid transparent;
-	}
-	.composer-input:focus {
-		border-color: var(--accent);
-	}
-	.send {
-		font: inherit;
-		font-weight: 600;
-		padding: 0 1.25rem;
-		border: none;
-		border-radius: 8px;
-		cursor: pointer;
-		background: linear-gradient(120deg, var(--accent), #2dd4bf);
-		color: #042f2e;
-	}
-	.send:disabled {
-		opacity: 0.45;
-		cursor: not-allowed;
+		border-radius: 1.35rem;
+		padding: 0.75rem;
 	}
 
-	.fineprint {
-		font-size: 0.72rem;
-		color: var(--text-muted);
-		margin: 0.25rem 0 0;
+	.composer-main {
+		gap: 0.75rem;
 	}
-	.mono {
-		font-family: 'JetBrains Mono', ui-monospace, monospace;
-		font-size: 0.72em;
+
+	textarea {
+		flex: 1;
+		min-width: 0;
+		resize: none;
+		border: 0;
+		outline: none;
+		border-radius: 1rem;
+		padding: 0.9rem 1rem;
+		background: rgba(2, 6, 23, 0.5);
+		color: #f8fafc;
+		font: inherit;
+		line-height: 1.45;
+	}
+
+	textarea::placeholder {
+		color: #64748b;
+	}
+
+	.send {
+		align-self: stretch;
+		min-width: 6.5rem;
+	}
+
+	.composer-footer {
+		align-items: flex-start;
+		gap: 0.6rem;
+		flex-wrap: wrap;
+		margin-top: 0.6rem;
+	}
+
+	.composer-drawer {
+		position: relative;
+	}
+
+	.composer-drawer summary {
+		list-style: none;
+		border-radius: 999px;
+		padding: 0.5rem 0.75rem;
+		background: rgba(15, 23, 42, 0.8);
+		border: 1px solid rgba(148, 163, 184, 0.16);
+	}
+
+	.composer-drawer summary::-webkit-details-marker {
+		display: none;
+	}
+
+	.composer-drawer[open] summary {
+		border-color: rgba(94, 234, 212, 0.38);
+	}
+
+	.control-grid,
+	.sample-strip {
+		position: absolute;
+		bottom: calc(100% + 0.6rem);
+		left: 0;
+		z-index: 10;
+		width: min(28rem, 82vw);
+		border-radius: 1rem;
+		border: 1px solid rgba(148, 163, 184, 0.18);
+		background: rgba(8, 13, 24, 0.96);
+		box-shadow: 0 18px 60px rgba(0, 0, 0, 0.42);
+		padding: 0.85rem;
+	}
+
+	.control-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.85rem;
+	}
+
+	.control-grid label {
+		display: grid;
+		gap: 0.35rem;
+		color: #dbeafe;
+	}
+
+	.control-grid output {
+		color: #5eead4;
+		font-weight: 800;
+	}
+
+	input[type='range'] {
+		accent-color: #5eead4;
+	}
+
+	input[type='checkbox'] {
+		width: 1rem;
+		height: 1rem;
+		accent-color: #5eead4;
+	}
+
+	.check-row {
+		grid-template-columns: auto 1fr;
+		align-items: center;
+	}
+
+	.samples-drawer .sample-strip {
+		width: min(42rem, 88vw);
+	}
+
+	.sample-strip button {
+		padding: 0.55rem 0.75rem;
+		text-align: left;
+	}
+
+	.disclaimer {
+		margin: 0;
+		font-size: 0.82rem;
+		text-align: center;
+	}
+
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	@media (max-width: 920px) {
+		.app-shell,
+		.app-shell.rail-minimized {
+			grid-template-columns: 1fr;
+		}
+
+		.session-rail {
+			position: fixed;
+			inset: auto 0 0 0;
+			z-index: 20;
+			max-height: 42vh;
+			border-right: 0;
+			border-top: 1px solid rgba(148, 163, 184, 0.16);
+		}
+
+		.app-shell.rail-minimized .session-rail {
+			left: auto;
+			width: 5rem;
+			border-left: 1px solid rgba(148, 163, 184, 0.16);
+		}
+
+		.chat-main {
+			padding-bottom: 6rem;
+		}
+
+		.meta-row,
+		.sample-grid,
+		.split,
+		.control-grid {
+			grid-template-columns: 1fr;
+		}
+
+		.topbar {
+			align-items: flex-start;
+			flex-direction: column;
+		}
+
+		.live-pill {
+			max-width: 100%;
+		}
+	}
+
+	@media (max-width: 640px) {
+		.chat-main {
+			padding: 0.75rem 0.75rem 6rem;
+		}
+
+		.composer-main {
+			align-items: stretch;
+			flex-direction: column;
+		}
+
+		.send {
+			min-height: 2.8rem;
+		}
+
+		.message,
+		.message.user {
+			grid-template-columns: 1fr;
+			margin-right: 0;
+		}
+
+		.avatar {
+			display: none;
+		}
 	}
 </style>
