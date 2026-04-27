@@ -1,8 +1,23 @@
 <script lang="ts">
-	import { tick } from 'svelte';
+	import { onMount, tick } from 'svelte';
+	import { browser } from '$app/environment';
+	import DOMPurify from 'isomorphic-dompurify';
+
+	import { applyTheme, resolveInitialTheme, type Theme } from '$lib/theme';
+
+	const SESSIONS_STORAGE_KEY = 'medication-reference-chat-sessions-v1';
+	const DEV_MODE_STORAGE_KEY = 'medication-reference-dev-mode';
 
 	type Role = 'user' | 'assistant';
-	type ChatTurn = { id: string; role: Role; content: string };
+	type RecallSeverity = 'class1' | 'class2' | 'class3' | 'unknown';
+	type RecallAlert = {
+		id: string;
+		drugName: string;
+		severity: RecallSeverity;
+		label: string;
+		sourceUrl: string;
+	};
+	type ChatTurn = { id: string; role: Role; content: string; recallAlerts?: RecallAlert[] };
 	type StatusEntry = { id: string; text: string };
 
 	type CorpusStats = {
@@ -93,7 +108,7 @@
 		const now = Date.now();
 		return {
 			id: nextChatId(),
-			title: 'New chat',
+			title: 'Empty conversation',
 			createdAt: now,
 			updatedAt: now,
 			messages: [],
@@ -106,7 +121,66 @@
 	let initialChat = createChatSession();
 	let sessions = $state<ChatSession[]>([initialChat]);
 	let activeChatId = $state(initialChat.id);
-	let railCollapsed = $state(false);
+	/** After true, session writes to localStorage are allowed (avoids clobbering before restore). */
+	let sessionStorageReady = $state(false);
+	/** Default closed so mobile CSS (drawer) does not flash open before hydration. Desktop is expanded in onMount. */
+	let railCollapsed = $state(true);
+
+	let isMobile = $state(false);
+	/** Last mqMobile.matches — used to close the rail when switching from desktop → mobile. */
+	let wasMobile = false;
+	let controlsOpen = $state(false);
+
+	/** Pipeline debug UI, corpus/model panels, and retrieval sliders — never shown to end users. */
+	let devModeEnabled = $state(false);
+
+	let showMobileBackdrop = $derived(isMobile && (!railCollapsed || (devModeEnabled && controlsOpen)));
+
+	function dismissMobileOverlays() {
+		railCollapsed = true;
+		controlsOpen = false;
+	}
+
+	function toggleDevMode() {
+		if (!browser) return;
+		try {
+			if (sessionStorage.getItem(DEV_MODE_STORAGE_KEY) === '1') {
+				sessionStorage.removeItem(DEV_MODE_STORAGE_KEY);
+				devModeEnabled = false;
+			} else {
+				sessionStorage.setItem(DEV_MODE_STORAGE_KEY, '1');
+				devModeEnabled = true;
+			}
+		} catch {
+			devModeEnabled = !devModeEnabled;
+		}
+	}
+
+	function toggleTheme() {
+		theme = theme === 'light' ? 'dark' : 'light';
+		applyTheme(theme);
+	}
+
+	function toggleRailCollapsed() {
+		if (railCollapsed) {
+			railCollapsed = false;
+			if (isMobile) {
+				controlsOpen = false;
+			}
+		} else {
+			railCollapsed = true;
+		}
+	}
+
+	function openMobileSessionRail() {
+		railCollapsed = false;
+		if (isMobile) controlsOpen = false;
+	}
+
+	function onControlsToggle(e: ToggleEvent & { currentTarget: HTMLDetailsElement }) {
+		if (!isMobile || !e.currentTarget.open) return;
+		railCollapsed = true;
+	}
 
 	let corpus = $state<CorpusStats | null>(null);
 	let apiConfig = $state<{
@@ -122,13 +196,20 @@
 
 	let input = $state('');
 	let loading = $state(false);
+	/** Narrow viewport: pipeline block starts collapsed so the message thread keeps height. */
+	let compactPipelineUi = $state(false);
+	/** false until matchMedia runs so mobile first paint is not an expanded 34vh block */
+	let pipelineDetailsOpen = $state(false);
 	let threadEl = $state<HTMLDivElement | undefined>(undefined);
 	let lastSentUserId = $state<string | null>(null);
 	let streamingMsgId = $state<string | null>(null);
 	let streamingPreAnswer = $state(false);
 
+	let theme = $state<Theme>('light');
+
 	let activeChat = $derived(sessions.find((session) => session.id === activeChatId) ?? sessions[0]);
 	let currentMessages = $derived(activeChat?.messages ?? []);
+	let hasAssistantReply = $derived(currentMessages.some((m) => m.role === 'assistant'));
 	let currentStatus = $derived(activeChat?.statusLines ?? []);
 	let currentResult = $derived(activeChat?.lastResult ?? null);
 	let currentError = $derived(activeChat?.requestError ?? null);
@@ -165,6 +246,29 @@
 		return clean.length > 42 ? `${clean.slice(0, 39)}...` : clean || 'New chat';
 	}
 
+	function firstUserContent(session: ChatSession): string | undefined {
+		const turn = session.messages.find((m) => m.role === 'user');
+		const t = turn?.content?.replace(/\s+/g, ' ').trim();
+		return t || undefined;
+	}
+
+	/** Sidebar primary line: always follows the first user question when present. */
+	function chatListTitle(session: ChatSession): string {
+		const first = firstUserContent(session);
+		if (first) return titleFromQuestion(first);
+		return 'Empty conversation';
+	}
+
+	/** Sidebar secondary line: status / last activity snippet. */
+	function chatListPreview(session: ChatSession): string {
+		const msgs = session.messages;
+		if (msgs.length === 0) return 'Ask your first question below';
+		const last = msgs.at(-1)!;
+		if (last.role === 'user' && msgs.length === 1) return 'Awaiting response…';
+		const raw = last.content.replace(/\s+/g, ' ').trim() || '…';
+		return raw.length > 52 ? `${raw.slice(0, 49)}…` : raw;
+	}
+
 	function esc(value: string): string {
 		return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 	}
@@ -195,6 +299,15 @@
 			.join('');
 	}
 
+	/** Safe HTML for {@html}: markdown pipeline output is sanitized (escaping alone is insufficient once tags are re-injected). */
+	function safeMarkdownHtml(text: string): string {
+		const raw = renderMarkdown(text);
+		return DOMPurify.sanitize(raw, {
+			ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'span', 'section', 'h4'],
+			ALLOWED_ATTR: ['class']
+		});
+	}
+
 	function messageClass(message: ChatTurn) {
 		return [
 			'message',
@@ -205,10 +318,6 @@
 		]
 			.filter(Boolean)
 			.join(' ');
-	}
-
-	function previewText(session: ChatSession) {
-		return session.messages.at(-1)?.content ?? 'No messages yet';
 	}
 
 	function formatTime(value: number) {
@@ -246,6 +355,54 @@
 		return [...new Set(result.redaction.entities.map((entity) => entity.entity_type))].join(', ');
 	}
 
+	function recallSeverityFromSection(section: string): RecallSeverity {
+		if (/class\s*iii\b/i.test(section)) return 'class3';
+		if (/class\s*ii\b/i.test(section)) return 'class2';
+		if (/class\s*i\b/i.test(section)) return 'class1';
+		return 'unknown';
+	}
+
+	function recallLabelForSeverity(sev: RecallSeverity): string {
+		if (sev === 'class1') return 'Class I recall';
+		if (sev === 'class2') return 'Class II recall';
+		if (sev === 'class3') return 'Class III recall';
+		return 'FDA recall';
+	}
+
+	/** Union retrieved + reranked so recalls dropped by reranking still surface in the UI. */
+	function extractRecallAlerts(result: PipelineResult): RecallAlert[] {
+		const merged = [...(result.retrieved ?? []), ...(result.reranked ?? [])];
+		const seen = new Set<string>();
+		const list: RecallAlert[] = [];
+		for (const src of merged) {
+			const meta = src.metadata ?? {};
+			if (String(meta.source ?? '') !== 'openfda_recall') continue;
+			if (seen.has(src.id)) continue;
+			const section = String(meta.section ?? '');
+			const sev = recallSeverityFromSection(section);
+			const drugName = String(meta.drug_name ?? 'unknown');
+			const url = String(meta.source_url ?? '');
+			if (!url.startsWith('http')) continue;
+			const label = recallLabelForSeverity(sev);
+			seen.add(src.id);
+			list.push({
+				id: src.id,
+				drugName,
+				severity: sev,
+				label,
+				sourceUrl: url
+			});
+		}
+		list.sort((a, b) => {
+			const rank = (s: RecallSeverity) =>
+				s === 'class1' ? 0 : s === 'class2' ? 1 : s === 'class3' ? 2 : 3;
+			const d = rank(a.severity) - rank(b.severity);
+			if (d !== 0) return d;
+			return a.drugName.localeCompare(b.drugName);
+		});
+		return list;
+	}
+
 	async function loadMeta() {
 		try {
 			const [stats, config] = await Promise.all([
@@ -264,23 +421,133 @@
 		void loadMeta();
 	});
 
+	$effect(() => {
+		if (!devModeEnabled) controlsOpen = false;
+	});
+
+	onMount(() => {
+		if (!browser) return;
+		if (!window.matchMedia('(max-width: 920px)').matches) {
+			railCollapsed = false;
+		}
+		theme = resolveInitialTheme();
+		applyTheme(theme);
+
+		try {
+			const params = new URLSearchParams(window.location.search);
+			if (params.get('dev') === 'true') {
+				sessionStorage.setItem(DEV_MODE_STORAGE_KEY, '1');
+				params.delete('dev');
+				const qs = params.toString();
+				const next = qs ? `${window.location.pathname}?${qs}${window.location.hash}` : `${window.location.pathname}${window.location.hash}`;
+				history.replaceState({}, '', next);
+			}
+			devModeEnabled = sessionStorage.getItem(DEV_MODE_STORAGE_KEY) === '1';
+		} catch {
+			devModeEnabled = false;
+		}
+		try {
+			const raw = localStorage.getItem(SESSIONS_STORAGE_KEY);
+			if (raw) {
+				const data = JSON.parse(raw) as {
+					sessions?: ChatSession[];
+					activeChatId?: string;
+					msgSeq?: number;
+					chatSeq?: number;
+					statusSeq?: number;
+				};
+				if (Array.isArray(data.sessions) && data.sessions.length > 0) {
+					sessions = data.sessions;
+					if (data.activeChatId && data.sessions.some((s) => s.id === data.activeChatId)) {
+						activeChatId = data.activeChatId;
+					} else {
+						activeChatId = data.sessions[0].id;
+					}
+					if (typeof data.msgSeq === 'number') msgSeq = data.msgSeq;
+					if (typeof data.chatSeq === 'number') chatSeq = data.chatSeq;
+					if (typeof data.statusSeq === 'number') statusSeq = data.statusSeq;
+				}
+			}
+		} catch {
+			// ignore corrupt storage
+		} finally {
+			sessionStorageReady = true;
+		}
+	});
+
+	$effect(() => {
+		if (!browser || !sessionStorageReady) return;
+		void sessions;
+		void activeChatId;
+		void msgSeq;
+		void chatSeq;
+		void statusSeq;
+		try {
+			localStorage.setItem(
+				SESSIONS_STORAGE_KEY,
+				JSON.stringify({ sessions, activeChatId, msgSeq, chatSeq, statusSeq })
+			);
+		} catch {
+			// quota / private mode
+		}
+	});
+
+	$effect(() => {
+		const mqMobile = window.matchMedia('(max-width: 920px)');
+		const mqCompact = window.matchMedia('(max-width: 640px)');
+		const sync = () => {
+			const nextMobile = mqMobile.matches;
+			if (nextMobile && !wasMobile) {
+				railCollapsed = true;
+			} else if (!nextMobile && wasMobile) {
+				railCollapsed = false;
+			}
+			wasMobile = nextMobile;
+			isMobile = nextMobile;
+			compactPipelineUi = mqCompact.matches;
+			pipelineDetailsOpen = !mqCompact.matches;
+		};
+		sync();
+		mqMobile.addEventListener('change', sync);
+		mqCompact.addEventListener('change', sync);
+		return () => {
+			mqMobile.removeEventListener('change', sync);
+			mqCompact.removeEventListener('change', sync);
+		};
+	});
+
+	$effect(() => {
+		if (!browser) return;
+		const lockScroll = isMobile && !railCollapsed;
+		document.body.style.overflow = lockScroll ? 'hidden' : '';
+		return () => {
+			document.body.style.overflow = '';
+		};
+	});
+
 	function startNewChat() {
 		const session = createChatSession();
 		sessions = [session, ...sessions];
 		activeChatId = session.id;
 		input = '';
+		if (isMobile) {
+			railCollapsed = true;
+		}
 		void scrollThreadToEnd('auto');
 	}
 
 	function selectChat(chatId: string) {
 		activeChatId = chatId;
+		if (isMobile) {
+			railCollapsed = true;
+		}
 		void scrollThreadToEnd('auto');
 	}
 
 	function clearActiveChat() {
 		updateChat(activeChatId, (session) => ({
 			...session,
-			title: 'New chat',
+			title: 'Empty conversation',
 			messages: [],
 			statusLines: [],
 			lastResult: null,
@@ -393,15 +660,32 @@
 					if (activeChatId === chatId) void scrollThreadToEnd('auto');
 				} else if (event === 'result') {
 					const result = data as PipelineResult;
-					updateChat(chatId, (session) => ({
-						...session,
-						lastResult: result,
-						statusLines: session.statusLines.length
-							? session.statusLines
-							: statusEntries(result.status_log ?? []),
-						requestError: result.error,
-						updatedAt: Date.now()
-					}));
+					// Ensure assistant row exists so recalls attach even when there were no streamed tokens.
+					ensureAssistantBubble();
+					const recalls = extractRecallAlerts(result);
+					updateChat(chatId, (session) => {
+						let messages = session.messages;
+						if (assistantId !== null) {
+							messages = session.messages.map((m) =>
+								m.id === assistantId
+									? {
+											...m,
+											recallAlerts: recalls.length ? recalls : undefined
+										}
+									: m
+							);
+						}
+						return {
+							...session,
+							messages,
+							lastResult: result,
+							statusLines: session.statusLines.length
+								? session.statusLines
+								: statusEntries(result.status_log ?? []),
+							requestError: result.error,
+							updatedAt: Date.now()
+						};
+					});
 
 					if (!streamedContent) {
 						ensureAssistantBubble();
@@ -493,20 +777,90 @@
 </script>
 
 <svelte:head>
-	<title>Drug RAG Chat</title>
+	<title>Medication Reference</title>
 	<meta
 		name="description"
-		content="Grounded drug interaction Q&A with PII redaction, RxNorm detection, on-the-fly ingest, and citations."
+		content="Ask about drug interactions and medication safety. Personal details are protected before lookup; answers cite FDA and NIH sources."
 	/>
+	<meta name="theme-color" content={theme === 'dark' ? '#0b1120' : '#fafafa'} />
 </svelte:head>
 
+<svelte:window
+	onkeydown={(e) => {
+		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'd') {
+			e.preventDefault();
+			toggleDevMode();
+			return;
+		}
+		if (e.key === 'Escape' && showMobileBackdrop) {
+			e.preventDefault();
+			dismissMobileOverlays();
+		}
+	}}
+/>
+
 <div class={['app-shell', railCollapsed && 'rail-minimized'].filter(Boolean).join(' ')}>
-	<aside class="session-rail" aria-label="Current session chats">
+	{#snippet pharmaMark()}
+		<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+			<text
+				x="12"
+				y="16.5"
+				text-anchor="middle"
+				fill="currentColor"
+				font-size="14"
+				font-family="Georgia, 'Times New Roman', 'Noto Serif', serif"
+				font-weight="600"
+			>℞</text>
+		</svg>
+	{/snippet}
+	{#snippet userAvatarGlyph()}
+		<svg class="avatar-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+			<path
+				stroke-linecap="round"
+				stroke-linejoin="round"
+				d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0A17.933 17.933 0 0 1 12 21.75c-2.676 0-5.216-.584-7.499-1.632Z"
+			/>
+		</svg>
+	{/snippet}
+	{#snippet assistantAvatarGlyph()}
+		<svg class="avatar-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+			<path stroke-linecap="round" d="M12 3v1.5M9 2.5v2M15 2.5v2" />
+			<rect x="4.5" y="6.5" width="15" height="12" rx="2" />
+			<circle cx="9.5" cy="12" r="0.9" fill="currentColor" stroke="none" />
+			<circle cx="14.5" cy="12" r="0.9" fill="currentColor" stroke="none" />
+			<path stroke-linecap="round" d="M9.5 16h5" />
+		</svg>
+	{/snippet}
+	{#snippet railToggleIcon()}
+		<svg class="rail-toggle-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+			<path
+				class="rail-toggle-path"
+				d="M9 5l6 7-6 7"
+				stroke="currentColor"
+				stroke-width="2"
+				stroke-linecap="round"
+				stroke-linejoin="round"
+			/>
+		</svg>
+	{/snippet}
+	{#if showMobileBackdrop}
+		<button
+			type="button"
+			class="mobile-overlay-backdrop"
+			aria-label="Close panel"
+			onclick={dismissMobileOverlays}
+		></button>
+	{/if}
+	<aside
+		id="session-rail-panel"
+		class="session-rail"
+		aria-label="Current session chats"
+	>
 		<div class="rail-header">
-			<div class="brand-mark" aria-hidden="true">DR</div>
+			<div class="brand-mark" aria-hidden="true">{@render pharmaMark()}</div>
 			{#if !railCollapsed}
 				<div>
-					<p class="eyebrow">Drug RAG</p>
+					<p class="eyebrow">Medication Reference</p>
 					<h1>Session</h1>
 				</div>
 			{/if}
@@ -519,12 +873,12 @@
 			</button>
 			<button
 				type="button"
-				class="icon-button"
-				onclick={() => (railCollapsed = !railCollapsed)}
+				class="icon-button rail-toggle"
+				onclick={toggleRailCollapsed}
 				aria-label={railCollapsed ? 'Expand chat history' : 'Collapse chat history'}
-				aria-pressed={railCollapsed}
+				aria-expanded={!railCollapsed}
 			>
-				{railCollapsed ? '>' : '<'}
+				{@render railToggleIcon()}
 			</button>
 		</div>
 
@@ -537,8 +891,8 @@
 						onclick={() => selectChat(session.id)}
 						aria-current={session.id === activeChatId ? 'page' : undefined}
 					>
-						<span class="chat-title">{session.title}</span>
-						<span class="chat-preview">{previewText(session)}</span>
+						<span class="chat-title">{chatListTitle(session)}</span>
+						<span class="chat-preview">{chatListPreview(session)}</span>
 						<span class="chat-time">{formatTime(session.updatedAt)}</span>
 					</button>
 				{/each}
@@ -547,54 +901,90 @@
 	</aside>
 
 	<main class="chat-main">
+		<div class="main-max">
 		<header class="topbar">
-			<div>
-				<p class="eyebrow">Grounded interaction assistant</p>
-				<h2>Ask about drug interactions</h2>
-				<p class="subtle">PII is redacted before retrieval. Answers cite FDA and NIH public sources.</p>
+			<div class="topbar-primary">
+				{#if isMobile}
+					<button
+						type="button"
+						class="icon-button mobile-menu-btn"
+						onclick={openMobileSessionRail}
+						aria-label="Open chat history"
+						aria-controls="session-rail-panel"
+						aria-expanded={!railCollapsed}
+					>
+						<svg class="hamburger-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+							<path
+								d="M4 6h16M4 12h16M4 18h16"
+								stroke="currentColor"
+								stroke-width="2"
+								stroke-linecap="round"
+							/>
+						</svg>
+					</button>
+				{/if}
+				<div class="topbar-titles">
+					<p class="eyebrow">Citation-backed reference</p>
+					<h2>Ask about drug interactions</h2>
+					<p class="subtle">PII is redacted before retrieval. Answers cite FDA and NIH public sources.</p>
+				</div>
 			</div>
 
 			<div class="topbar-actions">
-				{#if loading}
-					<div class="live-pill" role="status" aria-live="polite">
-						<span class="spinner" aria-hidden="true"></span>
-						<span>{latestStatus || 'Running pipeline...'}</span>
-					</div>
-				{/if}
+				<button
+					type="button"
+					class="ghost small theme-toggle"
+					onclick={toggleTheme}
+					aria-label={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
+					title={theme === 'light' ? 'Dark mode' : 'Light mode'}
+				>
+					{#if theme === 'light'}
+						<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+							<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" stroke-linecap="round" stroke-linejoin="round" />
+						</svg>
+					{:else}
+						<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+							<circle cx="12" cy="12" r="5" />
+							<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke-linecap="round" />
+						</svg>
+					{/if}
+				</button>
 				<button type="button" class="ghost small" onclick={clearActiveChat} disabled={!hasMessages && !currentResult}>
 					Clear
 				</button>
 			</div>
 		</header>
 
-		<section class="meta-row" aria-label="Corpus and model metadata">
-			<details class="meta-card">
-				<summary>Corpus</summary>
-				{#if corpus}
-					<div class="metric-grid">
-						<div><strong>{corpus.n_chunks.toLocaleString()}</strong><span>chunks</span></div>
-						<div><strong>{corpus.n_drugs.toLocaleString()}</strong><span>drugs</span></div>
-						<div><strong>{corpus.n_sources.toLocaleString()}</strong><span>sources</span></div>
-					</div>
-					<p class="mono muted">{corpus.collection} / {corpus.embedding_model}</p>
-				{:else}
-					<p class="muted">Corpus stats unavailable. Check that the API is running.</p>
-				{/if}
-			</details>
+		{#if devModeEnabled && hasAssistantReply}
+			<section class="meta-row" aria-label="Corpus and model metadata">
+				<details class="meta-card">
+					<summary>Corpus</summary>
+					{#if corpus}
+						<div class="metric-grid">
+							<div><strong>{corpus.n_chunks.toLocaleString()}</strong><span>chunks</span></div>
+							<div><strong>{corpus.n_drugs.toLocaleString()}</strong><span>drugs</span></div>
+							<div><strong>{corpus.n_sources.toLocaleString()}</strong><span>sources</span></div>
+						</div>
+						<p class="mono muted">{corpus.collection} / {corpus.embedding_model}</p>
+					{:else}
+						<p class="muted">Corpus stats unavailable. Check that the API is running.</p>
+					{/if}
+				</details>
 
-			<details class="meta-card">
-				<summary>Model &amp; privacy</summary>
-				{#if apiConfig}
-					<p><span class="muted">Generation</span> <strong>{apiConfig.openrouter_model}</strong></p>
-					<p><span class="muted">PII backend</span> <strong>{apiConfig.pii_backend}</strong></p>
-					<p class={apiConfig.has_openrouter_key ? 'ok-text' : 'warn-text'}>
-						{apiConfig.has_openrouter_key ? 'OpenRouter key available' : 'No OpenRouter key; retrieval-only mode enabled'}
-					</p>
-				{:else}
-					<p class="muted">Config unavailable.</p>
-				{/if}
-			</details>
-		</section>
+				<details class="meta-card">
+					<summary>Model &amp; privacy</summary>
+					{#if apiConfig}
+						<p><span class="muted">Generation</span> <strong>{apiConfig.openrouter_model}</strong></p>
+						<p><span class="muted">PII backend</span> <strong>{apiConfig.pii_backend}</strong></p>
+						<p class={apiConfig.has_openrouter_key ? 'ok-text' : 'warn-text'}>
+							{apiConfig.has_openrouter_key ? 'OpenRouter key available' : 'No OpenRouter key; retrieval-only mode enabled'}
+						</p>
+					{:else}
+						<p class="muted">Config unavailable.</p>
+					{/if}
+				</details>
+			</section>
+		{/if}
 
 		{#if currentError}
 			<div class="banner error" role="alert">{currentError}</div>
@@ -603,14 +993,15 @@
 		<div class="thread" bind:this={threadEl}>
 			{#if !hasMessages}
 				<section class="empty-state">
-					<div class="empty-orb" aria-hidden="true">Rx</div>
-					<h2>Start a grounded Drug RAG chat</h2>
+					<div class="empty-orb" aria-hidden="true">{@render pharmaMark()}</div>
+					<h2>Ask your first question</h2>
 					<p>
-						Ask about combinations, contraindications, alcohol warnings, or how a drug may affect another. The
-						pipeline will redact PII, detect drug names, retrieve sources, rerank citations, and stream the answer.
+						Ask about combinations, contraindications, alcohol warnings, or how one medication may affect another.
+						Personal details are removed before lookup; answers are drawn from retrieved FDA and NIH sources and shown
+						with citations.
 					</p>
-					<div class="sample-grid" aria-label="Sample prompts">
-						{#each sampleQuestions.slice(0, 4) as sample (sample)}
+					<div class="sample-grid" aria-label="Example questions">
+						{#each sampleQuestions as sample (sample)}
 							<button type="button" class="sample-card" disabled={loading} onclick={() => send(sample)}>
 								{sample}
 							</button>
@@ -620,11 +1011,39 @@
 			{:else}
 				{#each currentMessages as message (message.id)}
 					<article class={messageClass(message)}>
-						<div class="avatar" aria-hidden="true">{message.role === 'user' ? 'You' : 'AI'}</div>
+						<div class="avatar" aria-hidden="true">
+							{#if message.role === 'user'}
+								{@render userAvatarGlyph()}
+							{:else}
+								{@render assistantAvatarGlyph()}
+							{/if}
+						</div>
 						<div class="message-content">
-							<div class="message-label">{message.role === 'user' ? 'You' : 'Drug RAG'}</div>
+							<div class="message-label">{message.role === 'user' ? 'You' : 'Assistant'}</div>
 							{#if message.role === 'assistant'}
-								<div class="answer-body">{@html renderMarkdown(message.content)}</div>
+								{#if message.recallAlerts?.length}
+									<div
+										class="recall-strip"
+										role="group"
+										aria-label="FDA drug recalls found in sources for this answer"
+									>
+										<p class="recall-strip-title">FDA recalls in sources</p>
+										<div class="recall-chips">
+											{#each message.recallAlerts as alert (alert.id)}
+												<a
+													class={['recall-chip', `recall-sev-${alert.severity}`].join(' ')}
+													href={alert.sourceUrl}
+													target="_blank"
+													rel="noopener noreferrer"
+												>
+													<span class="recall-chip-label">{alert.label}</span>
+													<span class="recall-chip-drug">{alert.drugName}</span>
+												</a>
+											{/each}
+										</div>
+									</div>
+								{/if}
+								<div class="answer-body">{@html safeMarkdownHtml(message.content)}</div>
 							{:else}
 								<p>{message.content}</p>
 							{/if}
@@ -634,18 +1053,23 @@
 
 				{#if loading && !streamingMsgId}
 					<article class="message assistant pending" aria-busy="true">
-						<div class="avatar" aria-hidden="true">AI</div>
+						<div class="avatar" aria-hidden="true">{@render assistantAvatarGlyph()}</div>
 						<div class="message-content">
-							<div class="message-label">Drug RAG</div>
-							<p class="typing">Searching sources<span aria-hidden="true">...</span></p>
+							<div class="message-label">Assistant</div>
+							<p class="typing loading-status" role="status" aria-live="polite">
+								<span class="spinner" aria-hidden="true"></span>
+								<span>{latestStatus || 'Searching sources…'}</span>
+							</p>
 						</div>
 					</article>
 				{/if}
 			{/if}
 		</div>
 
-		{#if currentStatus.length || currentResult}
-			<section class="details-stack" aria-label="Pipeline details">
+		{#if devModeEnabled && (currentStatus.length || currentResult)}
+			<details class="details-stack" bind:open={pipelineDetailsOpen}>
+				<summary class="details-stack-summary">Pipeline &amp; sources</summary>
+				<div class="details-stack-body">
 				{#if currentStatus.length}
 					<details class="detail-panel" open={loading}>
 						<summary>Pipeline status</summary>
@@ -710,7 +1134,7 @@
 						</div>
 					</details>
 
-					<details class="detail-panel" open>
+					<details class="detail-panel" open={!compactPipelineUi}>
 						<summary>Citations &amp; reranked sources</summary>
 						{#if currentResult.reranked.length}
 							<div class="source-list">
@@ -759,85 +1183,71 @@
 						{/if}
 					</details>
 				{/if}
-			</section>
+				</div>
+			</details>
 		{/if}
 
-		<form class="composer" onsubmit={onSubmit}>
-			<div class="composer-main">
-				<label class="sr-only" for="question-input">Ask a drug interaction question</label>
-				<textarea
-					id="question-input"
-					bind:value={input}
-					onkeydown={handleComposerKeydown}
-					placeholder="Ask about a drug combination..."
-					rows="2"
-					disabled={loading}
-				></textarea>
-				<button type="submit" class="primary send" disabled={loading || !input.trim()}>
-					{loading ? 'Running' : 'Send'}
-				</button>
-			</div>
+		<div class={['composer', controlsOpen && devModeEnabled && 'composer-drawer-active'].filter(Boolean).join(' ')}>
+			<form class="composer-form" onsubmit={onSubmit}>
+				<div class="composer-main">
+					<label class="sr-only" for="question-input">Ask a drug interaction question</label>
+					<textarea
+						id="question-input"
+						bind:value={input}
+						onkeydown={handleComposerKeydown}
+						placeholder="Ask about a drug combination..."
+						rows="2"
+						disabled={loading}
+					></textarea>
+					<button type="submit" class="primary send" disabled={loading || !input.trim()}>
+						{loading ? 'Sending…' : 'Send'}
+					</button>
+				</div>
+			</form>
 
-			<div class="composer-footer">
-				<details class="composer-drawer">
-					<summary>Controls</summary>
-					<div class="control-grid">
-						<label>
-							<span>Retrieve top-k</span>
-							<input type="range" min="5" max="50" step="5" bind:value={topKRetrieve} />
-							<output>{topKRetrieve}</output>
-						</label>
-						<label>
-							<span>Rerank top-k</span>
-							<input type="range" min="1" max="10" step="1" bind:value={topKRerank} />
-							<output>{topKRerank}</output>
-						</label>
-						<label class="check-row">
-							<input type="checkbox" bind:checked={autoIngest} />
-							<span>Auto-ingest unknown drugs</span>
-						</label>
-						<label class="check-row">
-							<input
-								type="checkbox"
-								bind:checked={skipGeneration}
-								disabled={apiConfig?.has_openrouter_key === false}
-							/>
-							<span>Skip LLM</span>
-						</label>
-					</div>
-				</details>
-
-				<details class="composer-drawer samples-drawer">
-					<summary>Samples</summary>
-					<div class="sample-strip">
-						{#each sampleQuestions as sample (sample)}
-							<button type="button" disabled={loading} onclick={() => send(sample)}>{sample}</button>
-						{/each}
-					</div>
-				</details>
-			</div>
-		</form>
-
-		<p class="disclaimer">
-			Educational demo only. This is not medical advice; confirm decisions with a clinician or pharmacist.
-		</p>
+			{#if devModeEnabled}
+				<div class="composer-footer">
+					<details class="composer-drawer" bind:open={controlsOpen} ontoggle={onControlsToggle}>
+						<summary>Controls</summary>
+						<div class="control-grid">
+							<label>
+								<span>Retrieve top-k</span>
+								<input type="range" min="5" max="50" step="5" bind:value={topKRetrieve} />
+								<output>{topKRetrieve}</output>
+							</label>
+							<label>
+								<span>Rerank top-k</span>
+								<input type="range" min="1" max="10" step="1" bind:value={topKRerank} />
+								<output>{topKRerank}</output>
+							</label>
+							<label class="check-row">
+								<input type="checkbox" bind:checked={autoIngest} />
+								<span>Auto-ingest unknown drugs</span>
+							</label>
+							<label class="check-row">
+								<input
+									type="checkbox"
+									bind:checked={skipGeneration}
+									disabled={apiConfig?.has_openrouter_key === false}
+								/>
+								<span>Skip LLM</span>
+							</label>
+						</div>
+					</details>
+				</div>
+			{/if}
+		</div>
+		</div>
 	</main>
 </div>
 
 <style>
-	:global(body) {
-		overflow: hidden;
-	}
-
 	.app-shell {
-		min-height: 100vh;
+		min-height: 100dvh;
 		display: grid;
 		grid-template-columns: 18rem minmax(0, 1fr);
-		background:
-			radial-gradient(circle at top left, rgba(94, 234, 212, 0.14), transparent 34rem),
-			radial-gradient(circle at bottom right, rgba(96, 165, 250, 0.12), transparent 30rem),
-			#070a12;
-		color: #eef4ff;
+		background: var(--shell-bg);
+		color: var(--shell-fg);
 	}
 
 	.app-shell.rail-minimized {
@@ -845,9 +1255,8 @@
 	}
 
 	.session-rail {
-		border-right: 1px solid rgba(148, 163, 184, 0.16);
-		background: rgba(9, 14, 26, 0.78);
-		backdrop-filter: blur(18px);
+		border-right: 1px solid var(--rail-border);
+		background: var(--rail-bg);
 		padding: 1rem;
 		display: flex;
 		flex-direction: column;
@@ -871,31 +1280,67 @@
 		min-height: 3rem;
 	}
 
-	.brand-mark,
+	.brand-mark {
+		display: grid;
+		place-items: center;
+		width: 2.75rem;
+		height: 2.75rem;
+		flex: 0 0 auto;
+		border-radius: 10px;
+		background: var(--brand-mark-bg);
+		border: 1px solid var(--brand-mark-border);
+		color: var(--brand-mark-fg);
+		padding: 0.45rem;
+		box-sizing: border-box;
+	}
+
+	.brand-mark svg {
+		width: 100%;
+		height: 100%;
+		display: block;
+	}
+
 	.avatar,
 	.empty-orb {
 		display: grid;
 		place-items: center;
 		border-radius: 999px;
-		background: linear-gradient(135deg, rgba(94, 234, 212, 0.22), rgba(96, 165, 250, 0.18));
-		border: 1px solid rgba(148, 163, 184, 0.22);
-		color: #b7fff1;
+		background: var(--chip-bg);
+		border: 1px solid var(--chip-border);
+		color: var(--chip-fg);
 		font-weight: 800;
 	}
 
-	.brand-mark {
-		width: 2.75rem;
-		height: 2.75rem;
-		flex: 0 0 auto;
+	.avatar :global(.avatar-glyph) {
+		width: 1.1rem;
+		height: 1.1rem;
+		display: block;
+	}
+
+	.empty-orb {
+		width: 4.5rem;
+		height: 4.5rem;
+		border-radius: 14px;
+		background: var(--empty-orb-bg);
+		border: 1px solid var(--empty-orb-border);
+		color: var(--chip-fg);
+		padding: 0.85rem;
+		box-sizing: border-box;
+	}
+
+	.empty-orb svg {
+		width: 100%;
+		height: 100%;
+		display: block;
 	}
 
 	.eyebrow {
 		margin: 0;
-		color: #5eead4;
+		color: var(--eyebrow);
 		text-transform: uppercase;
 		letter-spacing: 0.12em;
 		font-size: 0.72rem;
-		font-weight: 800;
+		font-weight: 500;
 	}
 
 	h1,
@@ -908,6 +1353,7 @@
 	.rail-header h1,
 	.topbar h2 {
 		margin: 0;
+		color: var(--text-heading);
 	}
 
 	.rail-actions {
@@ -932,9 +1378,7 @@
 	.primary,
 	.ghost,
 	.icon-button,
-	.chat-tab,
-	.sample-card,
-	.sample-strip button {
+	.sample-card {
 		border-radius: 999px;
 		transition:
 			transform 0.16s ease,
@@ -943,18 +1387,21 @@
 	}
 
 	.primary {
-		background: #5eead4;
-		color: #03110f;
-		font-weight: 800;
+		background: var(--btn-primary);
+		color: var(--brand-mark-fg);
+		font-weight: 600;
 		padding: 0.8rem 1.05rem;
+	}
+
+	.primary:hover:not(:disabled) {
+		background: var(--btn-primary-hover);
 	}
 
 	.primary:hover:not(:disabled),
 	.ghost:hover:not(:disabled),
 	.icon-button:hover,
 	.chat-tab:hover,
-	.sample-card:hover:not(:disabled),
-	.sample-strip button:hover:not(:disabled) {
+	.sample-card:hover:not(:disabled) {
 		transform: translateY(-1px);
 	}
 
@@ -971,14 +1418,51 @@
 
 	.icon-button,
 	.ghost {
-		border: 1px solid rgba(148, 163, 184, 0.18);
-		background: rgba(15, 23, 42, 0.72);
-		color: #e2e8f0;
+		border: 1px solid var(--btn-ghost-border);
+		background: var(--btn-ghost-bg);
+		color: var(--btn-ghost-fg);
+		font-weight: 500;
+	}
+
+	.theme-toggle {
+		display: inline-grid;
+		place-items: center;
+		min-width: 2.45rem;
+		padding-left: 0.62rem;
+		padding-right: 0.62rem;
+	}
+
+	.theme-icon {
+		width: 1.15rem;
+		height: 1.15rem;
+		display: block;
 	}
 
 	.icon-button {
 		width: 2.45rem;
 		height: 2.45rem;
+	}
+
+	.rail-toggle {
+		display: inline-grid;
+		place-items: center;
+		padding: 0;
+	}
+
+	.rail-toggle .rail-toggle-svg {
+		width: 1.15rem;
+		height: 1.15rem;
+		color: var(--btn-ghost-fg);
+	}
+
+	/* Collapsed: chevron right (open rail); expanded: chevron left (minimize) */
+	.rail-toggle .rail-toggle-path {
+		transform-origin: 12px 12px;
+		transform: scaleX(-1);
+	}
+
+	:global(.rail-minimized) .rail-toggle .rail-toggle-path {
+		transform: none;
 	}
 
 	.chat-list {
@@ -994,14 +1478,19 @@
 		display: grid;
 		gap: 0.25rem;
 		padding: 0.8rem;
-		color: #dbeafe;
-		background: rgba(15, 23, 42, 0.58);
-		border: 1px solid rgba(148, 163, 184, 0.12);
+		border-radius: var(--radius-md);
+		transition:
+			transform 0.16s ease,
+			border-color 0.16s ease,
+			background 0.16s ease;
+		color: var(--tab-fg);
+		background: var(--tab-bg);
+		border: 1px solid var(--border);
 	}
 
 	.chat-tab.active {
-		background: rgba(20, 184, 166, 0.14);
-		border-color: rgba(94, 234, 212, 0.42);
+		background: var(--tab-active-bg);
+		border-color: var(--tab-active-border);
 	}
 
 	.chat-title,
@@ -1012,15 +1501,14 @@
 	}
 
 	.chat-title {
-		font-weight: 800;
+		font-weight: 600;
 	}
 
 	.chat-preview,
 	.chat-time,
 	.subtle,
-	.muted,
-	.disclaimer {
-		color: #94a3b8;
+	.muted {
+		color: var(--text-muted);
 	}
 
 	.chat-preview,
@@ -1029,17 +1517,50 @@
 	}
 
 	.chat-main {
-		height: 100vh;
+		height: 100dvh;
+		min-height: 100dvh;
 		min-width: 0;
-		display: grid;
-		grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
-		gap: 0.85rem;
 		padding: 1.1rem;
+	}
+
+	.main-max {
+		max-width: 900px;
+		width: 100%;
+		margin: 0 auto;
+		min-width: 0;
+		min-height: 0;
+		height: 100%;
+		display: flex;
+		flex-direction: column;
+		gap: 0.85rem;
 	}
 
 	.topbar {
 		justify-content: space-between;
 		gap: 1rem;
+	}
+
+	.topbar-primary {
+		display: flex;
+		align-items: flex-start;
+		gap: 0.65rem;
+		min-width: 0;
+		flex: 1;
+	}
+
+	.topbar-titles {
+		min-width: 0;
+	}
+
+	.mobile-menu-btn {
+		flex: 0 0 auto;
+		margin-top: 0.1rem;
+	}
+
+	.hamburger-icon {
+		display: block;
+		width: 1.2rem;
+		height: 1.2rem;
 	}
 
 	.topbar h2 {
@@ -1056,30 +1577,12 @@
 		justify-content: flex-end;
 	}
 
-	.live-pill {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.5rem;
-		padding: 0.55rem 0.75rem;
-		border-radius: 999px;
-		background: rgba(94, 234, 212, 0.12);
-		color: #c8fff6;
-		border: 1px solid rgba(94, 234, 212, 0.24);
-		max-width: min(32rem, 52vw);
-	}
-
-	.live-pill span:last-child {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-
 	.spinner {
 		width: 0.9rem;
 		height: 0.9rem;
 		border-radius: 999px;
-		border: 2px solid rgba(94, 234, 212, 0.3);
-		border-top-color: #5eead4;
+		border: 2px solid var(--spinner-ring);
+		border-top-color: var(--spinner-cap);
 		animation: spin 0.8s linear infinite;
 		flex: 0 0 auto;
 	}
@@ -1099,10 +1602,9 @@
 	.meta-card,
 	.detail-panel,
 	.composer {
-		border: 1px solid rgba(148, 163, 184, 0.16);
-		background: rgba(15, 23, 42, 0.68);
-		box-shadow: 0 18px 60px rgba(0, 0, 0, 0.24);
-		backdrop-filter: blur(18px);
+		border: 1px solid var(--border);
+		background: var(--card-bg);
+		box-shadow: var(--card-shadow);
 	}
 
 	.meta-card,
@@ -1113,8 +1615,8 @@
 
 	summary {
 		cursor: pointer;
-		font-weight: 800;
-		color: #f8fafc;
+		font-weight: 500;
+		color: var(--summary-color);
 	}
 
 	.metric-grid {
@@ -1127,8 +1629,8 @@
 	.metric-grid div {
 		padding: 0.65rem;
 		border-radius: 0.8rem;
-		background: rgba(2, 6, 23, 0.35);
-		border: 1px solid rgba(148, 163, 184, 0.1);
+		background: var(--metric-cell-bg);
+		border: 1px solid var(--border);
 		display: grid;
 		gap: 0.2rem;
 	}
@@ -1138,7 +1640,7 @@
 	}
 
 	.metric-grid span {
-		color: #94a3b8;
+		color: var(--text-muted);
 		font-size: 0.78rem;
 	}
 
@@ -1153,12 +1655,13 @@
 	}
 
 	.banner.error {
-		background: rgba(251, 113, 133, 0.12);
-		border: 1px solid rgba(251, 113, 133, 0.3);
-		color: #fecdd3;
+		background: var(--error-banner-bg);
+		border: 1px solid var(--error-banner-border);
+		color: var(--error-banner-fg);
 	}
 
 	.thread {
+		flex: 1;
 		min-height: 0;
 		overflow: auto;
 		padding: 0.4rem 0.25rem 1rem;
@@ -1177,37 +1680,29 @@
 		padding: 2rem 1rem;
 	}
 
-	.empty-orb {
-		width: 4.2rem;
-		height: 4.2rem;
-	}
-
 	.empty-state h2 {
 		margin: 0;
 		font-size: clamp(1.8rem, 4vw, 3.4rem);
 		letter-spacing: -0.05em;
+		color: var(--text-heading);
 	}
 
 	.empty-state p {
 		max-width: 43rem;
-		color: #b6c2d4;
+		color: var(--empty-body);
 	}
 
 	.sample-grid {
 		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
+		grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
 		gap: 0.75rem;
-		width: min(100%, 46rem);
-	}
-
-	.sample-card,
-	.sample-strip button {
-		color: #dbeafe;
-		background: rgba(15, 23, 42, 0.72);
-		border: 1px solid rgba(148, 163, 184, 0.16);
+		width: min(100%, 52rem);
 	}
 
 	.sample-card {
+		color: var(--sample-card-fg);
+		background: var(--sample-card-bg);
+		border: 1px solid var(--sample-card-border);
 		border-radius: 1rem;
 		padding: 0.9rem;
 		text-align: left;
@@ -1234,30 +1729,109 @@
 	}
 
 	.message.user .avatar {
-		background: rgba(96, 165, 250, 0.2);
-		color: #bfdbfe;
+		background: var(--msg-user-avatar-bg);
+		color: var(--msg-user-avatar-fg);
 	}
 
 	.message-content {
 		border-radius: 1.2rem;
 		padding: 0.9rem 1rem;
-		background: rgba(15, 23, 42, 0.78);
-		border: 1px solid rgba(148, 163, 184, 0.14);
+		background: var(--msg-assistant-bg);
+		border: 1px solid var(--msg-assistant-border);
 	}
 
 	.message.user .message-content {
-		background: rgba(37, 99, 235, 0.18);
-		border-color: rgba(96, 165, 250, 0.26);
+		background: var(--msg-user-bg);
+		border-color: var(--msg-user-border);
 	}
 
 	.message.pre-answer .message-content {
-		border-color: rgba(251, 191, 36, 0.32);
+		border-color: var(--pre-stream-border);
+	}
+
+	.recall-strip {
+		margin-bottom: 0.75rem;
+		padding: 0.65rem 0.75rem;
+		border-radius: 0.85rem;
+		background: var(--recall-strip-bg);
+		border: 1px solid var(--recall-strip-border);
+	}
+
+	.recall-strip-title {
+		margin: 0 0 0.45rem;
+		font-size: 0.72rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--text-muted);
+	}
+
+	.recall-chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.45rem;
+	}
+
+	.recall-chip {
+		display: inline-flex;
+		flex-direction: column;
+		gap: 0.06rem;
+		align-items: flex-start;
+		text-decoration: none;
+		border-radius: 0.75rem;
+		padding: 0.45rem 0.65rem;
+		font-size: 0.8rem;
+		line-height: 1.25;
+		border: 1px solid transparent;
+		transition:
+			transform 0.15s ease,
+			box-shadow 0.15s ease;
+	}
+
+	.recall-chip:hover {
+		transform: translateY(-1px);
+		box-shadow: 0 2px 10px rgba(15, 23, 42, 0.1);
+	}
+
+	.recall-chip-label {
+		font-weight: 700;
+	}
+
+	.recall-chip-drug {
+		font-size: 0.74rem;
+		font-weight: 500;
+		opacity: 0.9;
+		text-transform: capitalize;
+	}
+
+	.recall-sev-class1 {
+		background: var(--recall-class1-bg);
+		border-color: var(--recall-class1-border);
+		color: var(--recall-class1-fg);
+	}
+
+	.recall-sev-class2 {
+		background: var(--recall-class2-bg);
+		border-color: var(--recall-class2-border);
+		color: var(--recall-class2-fg);
+	}
+
+	.recall-sev-class3 {
+		background: var(--recall-class3-bg);
+		border-color: var(--recall-class3-border);
+		color: var(--recall-class3-fg);
+	}
+
+	.recall-sev-unknown {
+		background: var(--recall-unknown-bg);
+		border-color: var(--recall-unknown-border);
+		color: var(--recall-unknown-fg);
 	}
 
 	.message-label {
-		color: #94a3b8;
+		color: var(--text-muted);
 		font-size: 0.78rem;
-		font-weight: 800;
+		font-weight: 500;
 		margin-bottom: 0.35rem;
 	}
 
@@ -1275,38 +1849,88 @@
 	}
 
 	.answer-body :global(.cite) {
-		color: #5eead4;
-		font-weight: 800;
+		color: var(--link-cite);
+		font-weight: 600;
 	}
 
 	.answer-body :global(.md-section h4) {
 		margin: 0 0 0.35rem;
-		color: #e0f2fe;
+		color: var(--md-heading);
 	}
 
 	.typing {
-		color: #b6c2d4;
+		color: var(--text-muted);
 	}
 
+	.loading-status {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin: 0;
+		min-height: 1.25rem;
+	}
+
+	.loading-status .spinner {
+		flex-shrink: 0;
+	}
+
+	/* Ring matches user bubble: cool blue (same family as #eff6ff / #1e40af), not green-teal */
 	.sent-flash .message-content {
 		animation: flash 0.7s ease;
 	}
 
 	@keyframes flash {
 		0% {
-			box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.35);
+			box-shadow: 0 0 0 0 rgba(30, 64, 175, 0.38);
 		}
 		100% {
-			box-shadow: 0 0 0 14px rgba(94, 234, 212, 0);
+			box-shadow: 0 0 0 14px rgba(30, 64, 175, 0);
 		}
 	}
 
 	.details-stack {
+		min-width: 0;
+	}
+
+	.details-stack-summary {
+		list-style: none;
+		cursor: pointer;
+		font-weight: 600;
+		color: var(--summary-color);
+		padding: 0.75rem 0.9rem;
+		border-radius: 1.1rem;
+		border: 1px solid var(--border);
+		background: var(--card-bg);
+		box-shadow: var(--card-shadow);
+	}
+
+	.details-stack-summary::-webkit-details-marker {
+		display: none;
+	}
+
+	.details-stack-body {
 		display: grid;
 		gap: 0.65rem;
+		margin-top: 0.65rem;
+		padding-right: 0.2rem;
 		max-height: 34vh;
 		overflow: auto;
-		padding-right: 0.2rem;
+	}
+
+	@media (max-width: 640px) {
+		.details-stack-body {
+			max-height: min(50dvh, 22rem);
+		}
+	}
+
+	@media (min-width: 641px) {
+		.details-stack[open] .details-stack-summary {
+			display: none;
+		}
+
+		.details-stack[open] .details-stack-body {
+			margin-top: 0;
+		}
 	}
 
 	.detail-panel {
@@ -1328,9 +1952,9 @@
 		overflow-wrap: anywhere;
 		border-radius: 0.8rem;
 		padding: 0.8rem;
-		color: #dbeafe;
-		background: rgba(2, 6, 23, 0.5);
-		border: 1px solid rgba(148, 163, 184, 0.12);
+		color: var(--pre-fg);
+		background: var(--pre-bg);
+		border: 1px solid var(--pre-border);
 	}
 
 	.note {
@@ -1341,17 +1965,16 @@
 
 	.ok,
 	.ok-text {
-		color: #86efac;
+		color: var(--success);
 	}
 
 	.warn,
 	.warn-text {
-		color: #fcd34d;
+		color: var(--warning);
 	}
 
 	.pill-list,
-	.metadata,
-	.sample-strip {
+	.metadata {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.5rem;
@@ -1360,8 +1983,8 @@
 	.data-pill,
 	.metadata span {
 		border-radius: 999px;
-		border: 1px solid rgba(148, 163, 184, 0.14);
-		background: rgba(2, 6, 23, 0.36);
+		border: 1px solid var(--border);
+		background: var(--data-pill-bg);
 		padding: 0.45rem 0.65rem;
 	}
 
@@ -1371,15 +1994,15 @@
 	}
 
 	.data-pill small {
-		color: #94a3b8;
+		color: var(--text-muted);
 	}
 
 	.ingest-box,
 	.source-card {
 		border-radius: 0.95rem;
 		padding: 0.85rem;
-		background: rgba(2, 6, 23, 0.34);
-		border: 1px solid rgba(148, 163, 184, 0.12);
+		background: var(--ingest-bg);
+		border: 1px solid var(--border);
 		margin-top: 0.8rem;
 	}
 
@@ -1394,7 +2017,7 @@
 	}
 
 	.score {
-		color: #5eead4;
+		color: var(--link-cite);
 		font-size: 0.82rem;
 	}
 
@@ -1403,13 +2026,13 @@
 	}
 
 	.metadata span {
-		color: #b6c2d4;
+		color: var(--text-muted);
 		font-size: 0.78rem;
 	}
 
 	.status-list {
 		margin-bottom: 0;
-		color: #cbd5e1;
+		color: var(--text-secondary);
 	}
 
 	.status-list li + li {
@@ -1429,12 +2052,19 @@
 		gap: 0.75rem;
 		padding: 0.55rem 0.65rem;
 		border-radius: 0.75rem;
-		background: rgba(2, 6, 23, 0.36);
+		background: var(--timing-cell-bg);
 	}
 
 	.composer {
 		border-radius: 1.35rem;
 		padding: 0.75rem;
+	}
+
+	.composer-form {
+		margin: 0;
+		border: 0;
+		padding: 0;
+		background: transparent;
 	}
 
 	.composer-main {
@@ -1445,18 +2075,18 @@
 		flex: 1;
 		min-width: 0;
 		resize: none;
-		border: 0;
 		outline: none;
 		border-radius: 1rem;
 		padding: 0.9rem 1rem;
-		background: rgba(2, 6, 23, 0.5);
-		color: #f8fafc;
+		background: var(--input-bg);
+		color: var(--input-fg);
 		font: inherit;
 		line-height: 1.45;
+		border: 1px solid var(--border);
 	}
 
 	textarea::placeholder {
-		color: #64748b;
+		color: var(--placeholder);
 	}
 
 	.send {
@@ -1479,8 +2109,8 @@
 		list-style: none;
 		border-radius: 999px;
 		padding: 0.5rem 0.75rem;
-		background: rgba(15, 23, 42, 0.8);
-		border: 1px solid rgba(148, 163, 184, 0.16);
+		background: var(--composer-drawer-summary-bg);
+		border: 1px solid var(--composer-drawer-summary-border);
 	}
 
 	.composer-drawer summary::-webkit-details-marker {
@@ -1488,68 +2118,51 @@
 	}
 
 	.composer-drawer[open] summary {
-		border-color: rgba(94, 234, 212, 0.38);
+		border-color: var(--composer-drawer-open-border);
 	}
 
-	.control-grid,
-	.sample-strip {
+	.control-grid {
 		position: absolute;
 		bottom: calc(100% + 0.6rem);
 		left: 0;
 		z-index: 10;
-		width: min(28rem, 82vw);
-		border-radius: 1rem;
-		border: 1px solid rgba(148, 163, 184, 0.18);
-		background: rgba(8, 13, 24, 0.96);
-		box-shadow: 0 18px 60px rgba(0, 0, 0, 0.42);
-		padding: 0.85rem;
-	}
-
-	.control-grid {
 		display: grid;
 		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 0.85rem;
+		width: min(28rem, 82vw);
+		max-height: 50vh;
+		overflow-y: auto;
+		border-radius: 1rem;
+		border: 1px solid var(--border);
+		background: var(--card-bg);
+		box-shadow: var(--shadow-popover);
+		padding: 0.85rem;
 	}
 
 	.control-grid label {
 		display: grid;
 		gap: 0.35rem;
-		color: #dbeafe;
+		color: var(--tab-fg);
 	}
 
 	.control-grid output {
-		color: #5eead4;
-		font-weight: 800;
+		color: var(--accent);
+		font-weight: 600;
 	}
 
 	input[type='range'] {
-		accent-color: #5eead4;
+		accent-color: var(--btn-primary);
 	}
 
 	input[type='checkbox'] {
 		width: 1rem;
 		height: 1rem;
-		accent-color: #5eead4;
+		accent-color: var(--btn-primary);
 	}
 
 	.check-row {
 		grid-template-columns: auto 1fr;
 		align-items: center;
-	}
-
-	.samples-drawer .sample-strip {
-		width: min(42rem, 88vw);
-	}
-
-	.sample-strip button {
-		padding: 0.55rem 0.75rem;
-		text-align: left;
-	}
-
-	.disclaimer {
-		margin: 0;
-		font-size: 0.82rem;
-		text-align: center;
 	}
 
 	.sr-only {
@@ -1565,28 +2178,77 @@
 	}
 
 	@media (max-width: 920px) {
+		.mobile-overlay-backdrop {
+			display: block;
+			position: fixed;
+			inset: 0;
+			z-index: 35;
+			margin: 0;
+			padding: 0;
+			border: 0;
+			border-radius: 0;
+			background: var(--mobile-overlay);
+			backdrop-filter: blur(2px);
+			cursor: pointer;
+			-webkit-tap-highlight-color: transparent;
+		}
+
+		/* Single main column; rail is a fixed left drawer (not in layout flow). */
 		.app-shell,
 		.app-shell.rail-minimized {
-			grid-template-columns: 1fr;
+			display: block;
 		}
 
 		.session-rail {
 			position: fixed;
-			inset: auto 0 0 0;
-			z-index: 20;
-			max-height: 42vh;
-			border-right: 0;
-			border-top: 1px solid rgba(148, 163, 184, 0.16);
+			z-index: 40;
+			top: 0;
+			bottom: 0;
+			left: 0;
+			width: min(20rem, 90vw);
+			max-width: 100%;
+			height: 100dvh;
+			max-height: 100dvh;
+			margin: 0;
+			border-right: 1px solid var(--rail-border);
+			border-top: none;
+			box-shadow: none;
+			transform: translate3d(-100%, 0, 0);
+			transition: transform 0.22s ease, box-shadow 0.22s ease;
+			overflow-y: auto;
+			overflow-x: hidden;
+			overscroll-behavior: contain;
+			-webkit-overflow-scrolling: touch;
+			padding: 1rem;
+			padding-top: max(1rem, env(safe-area-inset-top));
+			padding-left: max(1rem, env(safe-area-inset-left));
+			padding-bottom: max(1rem, env(safe-area-inset-bottom));
 		}
 
-		.app-shell.rail-minimized .session-rail {
-			left: auto;
-			width: 5rem;
-			border-left: 1px solid rgba(148, 163, 184, 0.16);
+		.app-shell:not(.rail-minimized) .session-rail {
+			transform: translate3d(0, 0, 0);
+			box-shadow: 4px 0 32px color-mix(in srgb, var(--shell-fg) 16%, transparent);
+		}
+
+		@media (prefers-reduced-motion: reduce) {
+			.session-rail {
+				transition: none;
+			}
 		}
 
 		.chat-main {
-			padding-bottom: 6rem;
+			height: auto;
+			min-height: 100dvh;
+			padding-bottom: max(1.1rem, env(safe-area-inset-bottom));
+		}
+
+		.composer.composer-drawer-active {
+			position: relative;
+			z-index: 45;
+		}
+
+		.composer-drawer[open] .control-grid {
+			z-index: 46;
 		}
 
 		.meta-row,
@@ -1600,15 +2262,11 @@
 			align-items: flex-start;
 			flex-direction: column;
 		}
-
-		.live-pill {
-			max-width: 100%;
-		}
 	}
 
 	@media (max-width: 640px) {
 		.chat-main {
-			padding: 0.75rem 0.75rem 6rem;
+			padding: 0.75rem 0.75rem max(0.75rem, env(safe-area-inset-bottom));
 		}
 
 		.composer-main {

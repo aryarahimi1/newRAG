@@ -4,7 +4,9 @@ Sources (all free, no keys):
 1. FDA DailyMed SPL XML  — gold-standard drug labels including the
    "Drug Interactions", "Warnings", "Contraindications" sections.
 2. NIH MedlinePlus drug pages — plain-language patient info.
-3. DrugBank Open Data (optional) — if you place the downloaded XML or CSV
+3. OpenFDA Drug Enforcement — active/recent FDA drug recalls (last ~2 years),
+   classified Class I/II/III with status and reason.
+4. DrugBank Open Data (optional) — if you place the downloaded XML or CSV
    at data/raw/drugbank_*.xml it will be parsed too.
 
 Run:
@@ -16,6 +18,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import logging
 import re
@@ -23,7 +26,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 if TYPE_CHECKING:
     from rag.drug_detect import DrugMention
@@ -112,6 +115,10 @@ SECTION_KEYWORDS = [
     "INDICATIONS AND USAGE",
     "USE IN SPECIFIC POPULATIONS",
     "PATIENT COUNSELING INFORMATION",
+    "CLINICAL PHARMACOLOGY",
+    "PHARMACOKINETICS",
+    "MECHANISM OF ACTION",
+    "DESCRIPTION",
 ]
 
 _clinical_splitter = RecursiveCharacterTextSplitter(
@@ -130,13 +137,13 @@ _prose_splitter = RecursiveCharacterTextSplitter(
 
 session = requests.Session()
 session.headers.update(
-    {"User-Agent": "drug-rag-demo/0.1 (educational; contact: demo@example.com)"}
+    {"User-Agent": "medication-reference-demo/0.1 (educational; contact: demo@example.com)"}
 )
 
 
 @dataclass
 class RawDoc:
-    source: str  # "dailymed", "medlineplus", "drugbank"
+    source: str  # "dailymed", "medlineplus", "drugbank", "openfda_recall"
     source_url: str
     drug_name: str
     section: str
@@ -438,6 +445,153 @@ def drugbank_fetch(drug_filter: Optional[Iterable[str]] = None) -> List[RawDoc]:
 
 
 # ---------------------------------------------------------------------------
+# OpenFDA Drug Enforcement (recalls)
+# ---------------------------------------------------------------------------
+
+OPENFDA_ENFORCEMENT_URL = "https://api.fda.gov/drug/enforcement.json"
+OPENFDA_RECALL_LOOKBACK_DAYS = 730  # ~2 years
+
+
+def _openfda_parse_date(s: Optional[str]) -> Optional[datetime.date]:
+    """Parse OpenFDA's YYYYMMDD date strings; return None on failure."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return datetime.datetime.strptime(s.strip(), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _openfda_first(value: Any) -> str:
+    """Coerce an OpenFDA field that may be a list or scalar to a clean string."""
+    if isinstance(value, list):
+        for v in value:
+            if v:
+                return str(v).strip()
+        return ""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def openfda_recalls_fetch(drug: str, limit: int = 50) -> List[RawDoc]:
+    """Fetch OpenFDA drug enforcement (recall) records for ``drug``.
+
+    Filtering rules:
+      * Time: ``recall_initiation_date`` within the last
+        ``OPENFDA_RECALL_LOOKBACK_DAYS`` days, EXCEPT ``Ongoing`` recalls
+        which are always kept (older ongoing recalls are still relevant).
+      * Status: keep ``Ongoing`` always; ``Completed`` only if within window;
+        ``Terminated`` only if within window AND classification is ``Class I``.
+      * Dedupe by ``recall_number``.
+
+    Returns ``[]`` on no results (404), network errors, or parse failures.
+    """
+    drug_q = (drug or "").strip().lower()
+    if not drug_q:
+        return []
+
+    # OpenFDA query: OR across generic_name and brand_name. Spaces become '+'
+    # in URL encoding, which OpenFDA accepts as the operator separator.
+    search_expr = (
+        f'(openfda.generic_name:"{drug_q}" OR openfda.brand_name:"{drug_q}")'
+    )
+    params = {"search": search_expr, "limit": int(limit)}
+
+    try:
+        r = session.get(OPENFDA_ENFORCEMENT_URL, params=params, timeout=30)
+    except requests.RequestException as exc:
+        logger.warning("OpenFDA recalls fetch failed for %s: %s", drug_q, exc)
+        return []
+
+    # 404 from OpenFDA means "no matching records" — normal, not an error.
+    if r.status_code == 404:
+        logger.debug("OpenFDA recalls: no results for %s", drug_q)
+        return []
+    try:
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("OpenFDA recalls HTTP error for %s: %s", drug_q, exc)
+        return []
+
+    try:
+        payload = r.json()
+    except ValueError as exc:
+        logger.warning("OpenFDA recalls JSON parse failed for %s: %s", drug_q, exc)
+        return []
+
+    results = payload.get("results") or []
+    if not results:
+        return []
+
+    cutoff = datetime.date.today() - datetime.timedelta(
+        days=OPENFDA_RECALL_LOOKBACK_DAYS
+    )
+
+    docs: List[RawDoc] = []
+    seen_recall_numbers: set = set()
+
+    for rec in results:
+        if not isinstance(rec, dict):
+            continue
+        recall_number = (rec.get("recall_number") or "").strip()
+        if not recall_number or recall_number in seen_recall_numbers:
+            continue
+
+        classification = (rec.get("classification") or "").strip() or "Unclassified"
+        status = (rec.get("status") or "").strip() or "Unknown"
+        init_date = _openfda_parse_date(rec.get("recall_initiation_date"))
+        within_window = init_date is not None and init_date >= cutoff
+
+        # Status + time filter.
+        if status == "Ongoing":
+            keep = True
+        elif status == "Completed":
+            keep = within_window
+        elif status == "Terminated":
+            keep = within_window and classification == "Class I"
+        else:
+            keep = within_window
+        if not keep:
+            continue
+
+        seen_recall_numbers.add(recall_number)
+
+        product = (rec.get("product_description") or "").strip()
+        reason = (rec.get("reason_for_recall") or "").strip()
+        firm = (rec.get("recalling_firm") or "").strip()
+        distribution = (rec.get("distribution_pattern") or "").strip()
+        voluntary = (rec.get("voluntary_mandated") or "").strip()
+        date_iso = init_date.isoformat() if init_date else "Unknown"
+
+        text = (
+            f"Recall #{recall_number} | {classification} | "
+            f"Status: {status} | Initiated: {date_iso}\n"
+            f"Product: {product or 'N/A'}\n"
+            f"Reason: {reason or 'N/A'}\n"
+            f"Recalling firm: {firm or 'N/A'}\n"
+            f"Distribution: {distribution or 'N/A'}\n"
+            f"Voluntary/Mandated: {voluntary or 'N/A'}"
+        )
+
+        source_url = (
+            f'{OPENFDA_ENFORCEMENT_URL}?search=recall_number:"{recall_number}"'
+        )
+
+        docs.append(
+            RawDoc(
+                source="openfda_recall",
+                source_url=source_url,
+                drug_name=drug_q,
+                section=f"FDA Recall - {classification}",
+                text=text,
+            )
+        )
+
+    return docs
+
+
+# ---------------------------------------------------------------------------
 # Chunk + embed
 # ---------------------------------------------------------------------------
 
@@ -447,7 +601,11 @@ def chunk_docs(raw_docs: List[RawDoc]):
     metas: List[dict] = []
     seen_ids = set()
     for doc in raw_docs:
-        splitter = _clinical_splitter if doc.source in ("dailymed", "drugbank") else _prose_splitter
+        splitter = (
+            _clinical_splitter
+            if doc.source in ("dailymed", "drugbank", "openfda_recall")
+            else _prose_splitter
+        )
         chunks = splitter.split_text(doc.text)
         for i, chunk in enumerate(chunks):
             fingerprint = hashlib.md5(
@@ -483,6 +641,7 @@ def ingest_drugs(
     use_dailymed: bool = True,
     use_medlineplus: bool = True,
     use_drugbank: bool = True,
+    use_openfda: bool = True,
     limit_per_drug: int = 1,
     on_progress: Optional[Callable[[str], None]] = None,
     sleep_between: float = 0.2,
@@ -541,6 +700,23 @@ def ingest_drugs(
             raw.extend(got)
             time.sleep(sleep_between)
 
+    if use_openfda:
+        for drug in drug_list:
+            extras = alias_map.get(drug, ())
+            terms = _ingest_search_terms(drug, extras)
+            _progress(f"OpenFDA Recalls: fetching {drug}…")
+            got: List[RawDoc] = []
+            for t in terms:
+                got = openfda_recalls_fetch(t)
+                if got:
+                    if t != drug:
+                        logger.info(
+                            "OpenFDA: matched via search term %r for %r", t, drug
+                        )
+                    break
+            raw.extend(got)
+            time.sleep(sleep_between)
+
     if use_drugbank:
         extra = drugbank_fetch(drug_filter=drug_list)
         if extra:
@@ -581,12 +757,13 @@ def ingest_drugs(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build the drug-RAG vector store")
+    ap = argparse.ArgumentParser(description="Build the Medication Reference vector store")
     ap.add_argument("--drugs", type=str, default=None, help="Comma-separated list")
     ap.add_argument("--reset", action="store_true", help="Wipe the collection first")
     ap.add_argument("--skip-dailymed", action="store_true")
     ap.add_argument("--skip-medlineplus", action="store_true")
     ap.add_argument("--skip-drugbank", action="store_true")
+    ap.add_argument("--skip-openfda", action="store_true")
     ap.add_argument("--limit-per-drug", type=int, default=1)
     args = ap.parse_args()
 
@@ -613,6 +790,7 @@ def main() -> int:
         use_dailymed=not args.skip_dailymed,
         use_medlineplus=not args.skip_medlineplus,
         use_drugbank=not args.skip_drugbank,
+        use_openfda=not args.skip_openfda,
         limit_per_drug=args.limit_per_drug,
         on_progress=_bar_progress,
     )

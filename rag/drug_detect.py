@@ -136,7 +136,7 @@ class DrugDetector:
         self._lock = Lock()
         self._session = requests.Session()
         self._session.headers.update(
-            {"User-Agent": "drug-rag-demo/0.1 (educational)"}
+            {"User-Agent": "medication-reference-demo/0.1 (educational)"}
         )
 
     # ------------------------------------------------------------------

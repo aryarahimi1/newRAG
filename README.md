@@ -1,8 +1,8 @@
-# Drug Interaction RAG
+# Medication Reference
 
-A small, end-to-end Retrieval-Augmented Generation demo that answers natural-language questions about drug interactions. Built as a technical-interview demo: **FastAPI** serves the existing `rag` pipeline unchanged; **SvelteKit** (static SPA) is the UI. Strong grounding + citations, and a PII redaction layer in front of the LLM.
+A small, end-to-end demo (**Medication Reference**) that answers natural-language questions about drug interactions (retrieval-augmented generation under the hood). Built as a technical-interview demo: **FastAPI** serves the existing `rag` pipeline unchanged; **SvelteKit** (static SPA) is the UI. Strong grounding + citations, and a PII redaction layer in front of the LLM.
 
-> **Educational demo only — not medical advice.** Answers are grounded in publicly available FDA DailyMed and NIH MedlinePlus content. Always verify with a licensed clinician.
+> **Educational demo only — not medical advice.** Answers are grounded in publicly available FDA DailyMed labels, NIH MedlinePlus monographs, and OpenFDA Drug Enforcement (recall) records. Always verify with a licensed clinician.
 
 ---
 
@@ -61,7 +61,7 @@ answer + [n] citations → Svelte UI (FastAPI `/api/chat`)
 ## Project layout
 
 ```
-drug-rag/
+newRAG/
 ├── api/
 │   └── main.py             # FastAPI: /api/chat, /api/corpus/stats, static UI (optional)
 ├── frontend/               # SvelteKit 5 + adapter-static (npm run dev / build)
@@ -69,7 +69,8 @@ drug-rag/
 │   ├── pipeline.py         # orchestrator: redact → detect → auto-ingest → retrieve → rerank → generate
 │   ├── redact.py           # PII layer (Presidio + regex fallback)
 │   ├── drug_detect.py      # RxNorm-backed drug mention detection
-│   ├── retrieve.py         # Chroma + MiniLM embedder + BM25 hybrid
+│   ├── query_rewrite.py    # PK intent expansion before hybrid retrieval
+│   ├── retrieve.py         # Chroma + MedCPT encoders + BM25 hybrid
 │   ├── rerank.py           # MS-MARCO cross-encoder
 │   └── generate.py         # DeepSeek via OpenRouter (OpenAI SDK)
 ├── scripts/
@@ -124,7 +125,7 @@ python -m scripts.ingest --drugs ibuprofen,warfarin,lisinopril
 python -m scripts.ingest --skip-medlineplus     # DailyMed only
 ```
 
-The script fetches **FDA DailyMed** SPL labels, **NIH MedlinePlus** monographs, and optionally **DrugBank Open Data** if you add files under `data/raw/`.
+The script fetches **FDA DailyMed** SPL labels, **NIH MedlinePlus** monographs, **OpenFDA Drug Enforcement** recalls (active and recent FDA drug recalls per drug, last ~2 years), and optionally **DrugBank Open Data** if you add files under `data/raw/`.
 
 ## Run the demo
 
@@ -190,6 +191,14 @@ Open <http://localhost:5173>. Set `CORS_ORIGINS` in `.env` if you use another or
 - **Streaming token display** — answer streams in word-by-word via SSE; pre-answer message shown immediately when auto-ingest triggers for an unknown drug.
 - **Design refresh** — animated background, DM Sans + JetBrains Mono fonts, custom scrollbar, spacing and border-radius design tokens.
 - **Configurable API proxy** — `VITE_API_PROXY` env var controls the backend target (defaults to `http://127.0.0.1:8000`).
+
+### Latest (since prior README)
+
+- **Product naming** — **Medication Reference** is used consistently: FastAPI title, `OPENROUTER_TITLE` in `.env`, and `User-Agent` strings on RxNorm and ingest HTTP clients (replacing the older “drug RAG” wording).
+- **PK-aware query rewrite** — new `rag/query_rewrite.py` detects lay phrasing for pharmacokinetic questions (e.g. how long a drug stays in the body, time to peak / onset) and *appends* matching SPL-style terms (`half-life`, `clearance`, `Tmax`, etc.) to the search query so hybrid retrieval can hit **Clinical Pharmacology** / **Pharmacokinetics** sections without re-ingest. Invoked from `retrieve.py` before embedding the query.
+- **Ingest: OpenFDA enforcement** — `scripts.ingest` pulls **Drug Enforcement** (recall) records from OpenFDA per drug by default (disable with `--skip-openfda`), so the corpus can include recall class and reason alongside labels. Additional DailyMed **section** keywords (e.g. `CLINICAL PHARMACOLOGY`, `PHARMACOKINETICS`, `MECHANISM OF ACTION`, `DESCRIPTION`) are prioritized for chunking.
+- **LLM system prompt** — `generate.py` frames the assistant as a broader **medication information** tool (label-supported indications, PK/MoA when present in context), not only drug–drug interactions.
+- **Frontend** — **light / dark** theme with persistence (`src/lib/theme.ts`, `data-theme` on `<html>`). **isomorphic-dompurify** sanitizes rendered answer HTML. Chat sessions use stable localStorage keys under the Medication Reference prefix; the UI can surface **recall** metadata when chunks carry OpenFDA enforcement source types. Substantial layout and styling updates in `+page.svelte` and `app.css` / `app.html`.
 
 ---
 

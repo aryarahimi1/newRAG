@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Drug Interaction RAG API",
+    title="Medication Reference API",
     description="PII redaction → RxNorm → auto-ingest → hybrid retrieve → rerank → generate",
     version="0.2.0",
     lifespan=lifespan,

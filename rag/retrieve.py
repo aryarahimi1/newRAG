@@ -29,6 +29,8 @@ from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
+from rag.query_rewrite import expand_pk_query
+
 DEFAULT_EMBEDDING_MODEL = "ncbi/MedCPT-Article-Encoder"
 DEFAULT_QUERY_ENCODER = "ncbi/MedCPT-Query-Encoder"
 DEFAULT_COLLECTION = "drug_docs"
@@ -265,6 +267,13 @@ class VectorStore:
         if self.count() == 0:
             return []
 
+        rewrite = expand_pk_query(query)
+        retrieval_query = rewrite.rewritten
+        if rewrite.changed:
+            logger.info(
+                "PK query rewrite fired: intents=%s", list(rewrite.matched)
+            )
+
         drug_filter: Optional[Set[str]] = None
         eff_where = where
         if restrict_to_drug_names:
@@ -280,10 +289,10 @@ class VectorStore:
 
         # Bias dense retrieval toward RxNorm canonical names when the user said
         # brands (Vyvanse, Ritalin) but chunks are tagged with ingredients.
-        embed_query = query
+        embed_query = retrieval_query
         if drug_filter:
             embed_query = (
-                f"{query}\nRelevant drugs (RxNorm): {', '.join(sorted(drug_filter))}"
+                f"{retrieval_query}\nRelevant drugs (RxNorm): {', '.join(sorted(drug_filter))}"
             )
 
         # Dense retrieval — fetch a larger candidate pool before merging.
@@ -327,7 +336,9 @@ class VectorStore:
         if _confident:
             merged = dense_chunks[:top_k]
         else:
-            bm25_chunks = self._bm25_search(query, top_k=dense_k, drug_filter=drug_filter)
+            bm25_chunks = self._bm25_search(
+                retrieval_query, top_k=dense_k, drug_filter=drug_filter
+            )
             merged = self._rrf_merge(dense_chunks, bm25_chunks, top_k=top_k)
 
         # If the corpus has no rows for these drugs, fall back to global search.
@@ -339,7 +350,7 @@ class VectorStore:
             return self.search(query, top_k=top_k, where=where, restrict_to_drug_names=None)
 
         # When 2+ drugs are scoped, guarantee every drug contributes its key
-        # safety sections — otherwise the LLM may only see one drug's
+        # clinical sections — otherwise the LLM may only see one drug's
         # "Drug Interactions" and refuse to reason about the combination.
         if drug_filter and len(drug_filter) >= 2:
             merged = self._ensure_per_drug_coverage(
@@ -353,24 +364,36 @@ class VectorStore:
     # ------------------------------------------------------------------
 
     _PRIORITY_SECTION_KEYWORDS = (
+        "BOXED WARNING",
+        # OpenFDA ingest stores exact title-case prefix + classification (not kw.title()).
+        "FDA Recall - Class I",
         "DRUG INTERACTIONS",
         "CONTRAINDICATIONS",
         "WARNINGS AND PRECAUTIONS",
-        "BOXED WARNING",
         "WARNINGS",
+        "CLINICAL PHARMACOLOGY",
+        "PHARMACOKINETICS",
     )
+
+    @staticmethod
+    def _priority_section_chroma_value(kw: str) -> str:
+        """Map a priority keyword to the stored ``metadata.section`` value."""
+        if kw.startswith("FDA Recall"):
+            return kw
+        return kw.title()
 
     def _fetch_priority_chunk_for_drug(
         self, drug_name: str
     ) -> Optional[RetrievedChunk]:
-        """Return one high-priority safety chunk for ``drug_name`` if available."""
+        """Return one high-priority clinical chunk for ``drug_name`` if available."""
         for kw in self._PRIORITY_SECTION_KEYWORDS:
+            section_eq = self._priority_section_chroma_value(kw)
             try:
                 got = self._collection.get(
                     where={
                         "$and": [
                             {"drug_name": drug_name},
-                            {"section": {"$eq": kw.title()}},
+                            {"section": {"$eq": section_eq}},
                         ]
                     },
                     limit=1,
@@ -411,7 +434,7 @@ class VectorStore:
         drug_filter: Set[str],
         top_k: int,
     ) -> List[RetrievedChunk]:
-        """Inject a safety chunk for any drug under-represented in ``merged``."""
+        """Inject a priority chunk for any drug under-represented in ``merged``."""
         present: dict[str, int] = {}
         for c in merged:
             dn = str(c.metadata.get("drug_name") or "").lower()
