@@ -18,6 +18,7 @@ Stages
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -37,6 +38,48 @@ from rag.retrieve import RetrievedChunk, VectorStore, get_store
 logger = logging.getLogger(__name__)
 
 _INGEST_LOCK = threading.Lock()
+
+
+def _thread_bundle_for_followups(
+    redactor: PIIRedactor,
+    history: Optional[List[dict]],
+    current_redacted: str,
+) -> str:
+    """Build one redacted string over prior user questions plus this turn.
+
+    Drug detection and hybrid retrieval originally saw only the latest message,
+    which breaks pronouns and short follow-ups (\"what about with aspirin?\")
+    once the RxNorm corpus scope is narrowed. Concatenating prior user lines
+    (each PII-redacted server-side for defense in depth) keeps retrieval and
+    RxNorm lookups aligned with the active chat thread.
+    """
+    current = current_redacted.strip()
+    turns = history or []
+    if not turns:
+        return current
+
+    max_prior = max(1, int(os.environ.get("RAG_THREAD_PRIOR_TURNS", "12")))
+    max_chars = max(2048, int(os.environ.get("RAG_THREAD_MAX_CHARS", "10000")))
+    prior = turns[-max_prior:] if len(turns) > max_prior else turns
+
+    segments: List[str] = []
+    for raw in prior:
+        if not isinstance(raw, dict):
+            continue
+        q = raw.get("question")
+        if not q or not str(q).strip():
+            continue
+        rq = redactor.redact(str(q)).redacted.strip()
+        if rq:
+            segments.append(rq)
+
+    joined = "\n".join(segments + [current]) if segments else current
+    while len(joined) > max_chars and len(segments) > 0:
+        segments.pop(0)
+        joined = "\n".join(segments + [current])
+    if len(joined) > max_chars:
+        joined = joined[-max_chars:]
+    return joined
 
 
 @dataclass
@@ -160,11 +203,15 @@ class RAGPipeline:
         redaction = self.redactor.redact(question)
         timing.redact_ms = (time.perf_counter() - t0) * 1000
 
+        thread_bundle = _thread_bundle_for_followups(
+            self.redactor, history, redaction.redacted
+        )
+
         # ----- 2. Detect drug mentions ------------------------------------
         _status("Detecting drug mentions via RxNorm…")
         t0 = time.perf_counter()
         try:
-            detected = self.detector.detect(redaction.redacted)
+            detected = self.detector.detect(thread_bundle)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Drug detection failed: %s", exc)
             detected = []
@@ -192,7 +239,7 @@ class RAGPipeline:
         t0 = time.perf_counter()
         scope = [m.canonical for m in detected] if detected else None
         retrieved = self.store.search(
-            redaction.redacted,
+            thread_bundle,
             top_k=k_retrieve,
             restrict_to_drug_names=scope,
         )
@@ -202,7 +249,9 @@ class RAGPipeline:
         _status("Reranking with cross-encoder…")
         t0 = time.perf_counter()
         reranked = self.reranker.rerank(
-            redaction.redacted, retrieved, top_k=k_rerank
+            thread_bundle,
+            retrieved,
+            top_k=k_rerank,
         )
         timing.rerank_ms = (time.perf_counter() - t0) * 1000
 

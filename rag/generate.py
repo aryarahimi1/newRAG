@@ -272,7 +272,8 @@ class DeepSeekGenerator:
         # Prior turns are plain text (no CONTEXT block) so the model treats them as
         # conversation context rather than retrieval grounding.
         messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for turn in (history or [])[-2:]:  # cap at last 2 turns to keep prompt small
+        max_turns = max(1, int(os.environ.get("RAG_LLM_HISTORY_TURNS", "12")))
+        for turn in (history or [])[-max_turns:]:
             messages.append({"role": "user", "content": turn["question"]})
             messages.append({"role": "assistant", "content": turn["answer"]})
         messages.append({"role": "user", "content": build_user_prompt(question, chunks)})
@@ -311,7 +312,8 @@ class DeepSeekGenerator:
     ) -> GenerationResult:
         """Same as generate() but streams tokens via on_token callback."""
         messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for turn in (history or [])[-2:]:
+        max_turns = max(1, int(os.environ.get("RAG_LLM_HISTORY_TURNS", "12")))
+        for turn in (history or [])[-max_turns:]:
             messages.append({"role": "user", "content": turn["question"]})
             messages.append({"role": "assistant", "content": turn["answer"]})
         messages.append({"role": "user", "content": build_user_prompt(question, chunks)})

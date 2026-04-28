@@ -182,6 +182,7 @@ Open <http://localhost:5173>. Set `CORS_ORIGINS` in `.env` if you use another or
 
 ### API
 
+- **Conversation-aware chat** — `POST /api/chat` and `POST /api/chat/stream` accept a JSON **`history`** array: `{ role: "user"|"assistant", content: string }` in order, alternating user then assistant per completed exchange. Omit or send `[]` for the first question in a thread. Used for scoped retrieval as well as the LLM.
 - **SSE streaming endpoint** — `/api/chat/stream` emits Server-Sent Events: `status`, `token`, `pre_answer`, `result`, `error`, and `done` frames. The UI renders tokens as they arrive instead of waiting for the full response.
 - **Security hardening** — model identifier removed from `/api/config` (was leaking provider/model names to unauthenticated callers). Internal fields (`persist_dir`, `embedding_model`, `collection`) stripped from `/api/corpus/stats`. Raw exception details no longer surfaced to clients.
 
@@ -194,6 +195,7 @@ Open <http://localhost:5173>. Set `CORS_ORIGINS` in `.env` if you use another or
 
 ### Latest (since prior README)
 
+- **Multi-turn follow-ups** — Each chat keeps its thread in the browser (localStorage). Every request sends **`history`** as completed user/assistant pairs. The backend now threads that conversation into RxNorm detection, hybrid retrieval, and reranking (prior user turns are concatenated redaction-safe, capped by size), not only into the LLM prompt—short follow-ups like “what about with aspirin?” still resolve drugs and sources from earlier turns. The generator includes up to 12 prior Q&A pairs before the grounded `CONTEXT` turn (was 2). Optional tuning: `RAG_THREAD_PRIOR_TURNS`, `RAG_THREAD_MAX_CHARS`, `RAG_LLM_HISTORY_TURNS` in `.env` (defaults in `.env.example`).
 - **Product naming** — **Medication Reference** is used consistently: FastAPI title, `OPENROUTER_TITLE` in `.env`, and `User-Agent` strings on RxNorm and ingest HTTP clients (replacing the older “drug RAG” wording).
 - **PK-aware query rewrite** — new `rag/query_rewrite.py` detects lay phrasing for pharmacokinetic questions (e.g. how long a drug stays in the body, time to peak / onset) and *appends* matching SPL-style terms (`half-life`, `clearance`, `Tmax`, etc.) to the search query so hybrid retrieval can hit **Clinical Pharmacology** / **Pharmacokinetics** sections without re-ingest. Invoked from `retrieve.py` before embedding the query.
 - **Ingest: OpenFDA enforcement** — `scripts.ingest` pulls **Drug Enforcement** (recall) records from OpenFDA per drug by default (disable with `--skip-openfda`), so the corpus can include recall class and reason alongside labels. Additional DailyMed **section** keywords (e.g. `CLINICAL PHARMACOLOGY`, `PHARMACOKINETICS`, `MECHANISM OF ACTION`, `DESCRIPTION`) are prioritized for chunking.
