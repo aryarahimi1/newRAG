@@ -21,6 +21,8 @@ export function getSystemTheme(): Theme {
 export function applyTheme(theme: Theme): void {
 	if (typeof document === 'undefined') return;
 	document.documentElement.dataset.theme = theme;
+	const meta = document.querySelector('meta[name="theme-color"]');
+	if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b1120' : '#fafafa');
 	try {
 		localStorage.setItem(STORAGE_KEY, theme);
 	} catch {

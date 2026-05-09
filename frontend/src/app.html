@@ -6,14 +6,25 @@
 				try {
 					var k = 'medication-reference-theme';
 					var t = localStorage.getItem(k);
-					if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
-					else if (window.matchMedia('(prefers-color-scheme: dark)').matches)
-						document.documentElement.dataset.theme = 'dark';
+					var meta = document.querySelector('meta[name="theme-color"]');
+					function paint(theme) {
+						document.documentElement.dataset.theme = theme;
+						if (meta)
+							meta.setAttribute('content', theme === 'dark' ? '#0b1120' : '#fafafa');
+					}
+					if (t === 'dark' || t === 'light') paint(t);
+					else if (window.matchMedia('(prefers-color-scheme: dark)').matches) paint('dark');
 				} catch (e) {}
 			})();
 		</script>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Medication Reference</title>
+		<meta
+			name="description"
+			content="Ask about drug interactions and medication safety. Personal details are protected before lookup; answers cite FDA and NIH sources."
+		/>
+		<meta name="theme-color" content="#fafafa" />
 		<link rel="preconnect" href="https://fonts.googleapis.com" />
 		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 		<link
